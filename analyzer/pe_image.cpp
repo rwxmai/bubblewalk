@@ -64,6 +64,30 @@ PeImage PeImage::parse(const std::vector<uint8_t>& raw) {
         p.sections_.push_back({va, span, u32(raw, at + 36)});
         if (rawSize) std::copy_n(raw.begin() + offset, rawSize, p.image_.begin() + va);
     }
+    if (u32(raw, opt + 108) > 3) {
+        uint32_t table = u32(raw, opt + 136), bytes = u32(raw, opt + 140);
+        if ((bytes % 12) || !fits(table, bytes, p.size_))
+            throw std::runtime_error("invalid exception directory");
+        uint32_t previous = 0;
+        for (uint32_t i = 0; i < bytes / 12; ++i) {
+            uint64_t at = uint64_t(table) + uint64_t(i) * 12;
+            RuntimeFunction entry{u32(p.image_, at), u32(p.image_, at + 4), u32(p.image_, at + 8)};
+            const bool mapped = entry.Begin == entry.End ||
+                std::any_of(p.sections_.begin(), p.sections_.end(), [&](const Section& section) {
+                    return entry.Begin >= section.Begin && entry.End >= entry.Begin &&
+                        fits(entry.Begin - section.Begin, entry.End - entry.Begin, section.Size);
+                });
+            if (entry.Begin > entry.End || entry.End > p.size_ ||
+                (i && entry.Begin < previous) || !mapped ||
+                !fits(entry.Unwind & ~1u, 4, p.size_))
+                throw std::runtime_error("invalid runtime function");
+            previous = entry.Begin;
+            /* pe: Omit zero-length .pdata markers from function lookup
+             * The 26100.1 kernel includes an empty range near its table end.
+             */
+            if (entry.Begin != entry.End) p.functions_.push_back(entry);
+        }
+    }
     return p;
 }
 
@@ -90,6 +114,14 @@ bool PeImage::executable(uint64_t rva) const {
         if (rva >= s.Begin && rva - s.Begin < s.Size)
             return (s.Characteristics & 0x20000000u) != 0;
     return false;
+}
+
+const RuntimeFunction* PeImage::function(uint64_t rva) const {
+    auto it = std::upper_bound(functions_.begin(), functions_.end(), rva,
+        [](uint64_t pc, const RuntimeFunction& f) { return pc < f.Begin; });
+    if (it == functions_.begin()) return nullptr;
+    --it;
+    return rva < it->End ? &*it : nullptr;
 }
 
 bool readRegion(uint64_t base, const uint8_t* bytes, size_t available,

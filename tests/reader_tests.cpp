@@ -21,7 +21,10 @@ int main() {
         auto pe=nu::PeImage::parse(bytes);
         require(pe.size()==0x4000 && pe.timestamp()==0x1234567,"identity parse");
         require(pe.executable(0x1010) && !pe.executable(0x2010),"section classification");
+        auto f=pe.function(0x1110);
+        require(f && f->Unwind==0x3010 && !pe.function(0x1400),"function lookup");
         uint8_t unwind[8]{};
+        require(pe.read(f->Unwind,unwind,sizeof(unwind)) && unwind[5]==0x0a,"machine-frame unwind metadata");
         require(!pe.read(UINT64_MAX,unwind,8),"RVA overflow rejected");
         require(!pe.read(0x1fff,unwind,8),"unmapped gap rejected");
         uint8_t stack[16]={1,2,3,4}, out[8]{};
@@ -30,7 +33,22 @@ int main() {
         require(!nu::readRegion(base,stack,sizeof(stack),base-1,out,1),"snapshot underflow rejected");
         require(!nu::readRegion(base,stack,sizeof(stack),UINT64_MAX,out,8),"snapshot overflow rejected");
         require(!nu::readRegion(base,stack,sizeof(stack),base+12,out,8),"snapshot truncation rejected");
-        std::cout << "PE mapping and snapshot bounds tests passed.\n";
+        rejects(bytes,[](auto& b){ b.resize(80); });
+        rejects(bytes,[](auto& b){ b[0x3f]=0xff; });
+        rejects(bytes,[](auto& b){ b[0x188+12]=0; b[0x188+13]=0; });
+        rejects(bytes,[](auto& b){ b[0x98+140]=35; });
+        rejects(bytes,[](auto& b){ b[0x608]=0xff; b[0x60b]=0xff; });
+        auto markers=bytes;
+        markers[0x98+140]=48;
+        auto word=[&](size_t at,uint32_t v) { std::memcpy(markers.data()+at,&v,4); };
+        word(0x624,0x1400); word(0x628,0x1400); word(0x62c,0x3000);
+        require(!nu::PeImage::parse(markers).function(0x1400),"empty pdata markers remain noncallable");
+        auto writable=bytes;
+        writable[0x188+40+39]|=0x80;
+        auto mutablePe=nu::PeImage::parse(writable);
+        require(!mutablePe.read(0x2000,out,8),"disk writable data cannot stand in for runtime memory");
+        std::cout << "Reader tests passed: identity, sections, unwind table, machine-frame metadata,\n"
+                     "snapshot translation, malformed images, and missing-memory boundaries.\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\n"; return 1;
