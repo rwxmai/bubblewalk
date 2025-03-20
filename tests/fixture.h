@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include "../include/protocol.h"
+#include "../include/target_26100_1.h"
 
 namespace nu {
 /* test: Chain ALLOC_SMALL through PUSH_MACHFRAME in .xdata */
@@ -36,5 +37,54 @@ inline std::vector<uint8_t> testImage() {
         }
     }
     return b;
+}
+}
+
+namespace nu {
+/* test: Fill every interrupted GPR with a distinct nonzero sentinel */
+inline NU_MODULE testContextSample(NU_SAMPLE& sample, NU_REGS& expected) {
+    sample={};
+    expected={};
+    NU_MODULE kernel{};
+    kernel.Base=0xfffff80010000000ull;
+    kernel.Size=NU_TARGET_SIZE;
+    kernel.Timestamp=NU_TARGET_TIMESTAMP;
+    kernel.Checksum=NU_TARGET_CHECKSUM;
+    kernel.Flags=NU_M_IDENTITY_VALID;
+    sample.Version=NU_VERSION;
+    sample.KernelBase=kernel.Base;
+    sample.Nmi.Base=0xffffa00000008000ull;
+    sample.Nmi.Size=0x800;
+    sample.Entry.Rsp=sample.Nmi.Base;
+    sample.Stack.Base=0xffffa00000108000ull;
+    sample.Stack.Size=64;
+    sample.InterruptedRip=kernel.Base+0x2010;
+    sample.InterruptedRsp=sample.Stack.Base;
+    sample.InterruptedCs=0x10;
+    sample.InterruptedFlags=0x202;
+    expected.Rip=sample.InterruptedRip;
+    expected.Rsp=sample.InterruptedRsp;
+    expected.Cs=0x10; expected.Ss=0x18; expected.Rflags=0x202;
+    const size_t f=sample.Nmi.Size-40;
+    auto put=[&](size_t at, uint64_t value) { std::memcpy(sample.NmiBytes+at, &value, 8); };
+    put(f,expected.Rip); put(f+8,expected.Cs); put(f+16,expected.Rflags);
+    put(f+24,expected.Rsp); put(f+32,expected.Ss);
+    put(f-0x170,kernel.Base+NU_TARGET_KI_RETURN);
+    put(f-0x2b0,kernel.Base+NU_TARGET_KX_RETURN);
+    struct Slot { size_t Offset; uint64_t NU_REGS::*Member; };
+    const Slot slots[]={
+        {0x138,&NU_REGS::Rax},{0x130,&NU_REGS::Rcx},{0x128,&NU_REGS::Rdx},
+        {0x120,&NU_REGS::R8},{0x118,&NU_REGS::R9},{0x110,&NU_REGS::R10},
+        {0x108,&NU_REGS::R11},{0x10,&NU_REGS::Rbp},{0x18,&NU_REGS::Rsi},
+        {0x1a8,&NU_REGS::Rbx},{0x1a0,&NU_REGS::Rdi},{0x190,&NU_REGS::R12},
+        {0x188,&NU_REGS::R13},{0x180,&NU_REGS::R14},{0x178,&NU_REGS::R15}
+    };
+    for (size_t i=0; i<sizeof(slots)/sizeof(slots[0]); ++i) {
+        expected.*(slots[i].Member)=0xaabbccdd00000000ull+i+1;
+        put(f-slots[i].Offset,expected.*(slots[i].Member));
+    }
+    /* test: Poison Kx's RSI save after Ki has overwritten ESI */
+    put(f-0x198,0xdeadbeef);
+    return kernel;
 }
 }

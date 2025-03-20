@@ -1,4 +1,5 @@
 #include "../analyzer/pe_image.h"
+#include "../analyzer/interrupted_context.h"
 #include "../include/protocol.h"
 #include "fixture.h"
 #include <cstring>
@@ -47,6 +48,28 @@ int main() {
         writable[0x188+40+39]|=0x80;
         auto mutablePe=nu::PeImage::parse(writable);
         require(!mutablePe.read(0x2000,out,8),"disk writable data cannot stand in for runtime memory");
+        NU_SAMPLE sample{};
+        NU_REGS expected{}, recovered{};
+        auto kernel=nu::testContextSample(sample,expected);
+        std::string error;
+        require(nu::interruptedContext(sample,kernel,recovered,error),"pinned interrupted context");
+        require(!std::memcmp(&expected,&recovered,sizeof(expected)),"all interrupted GPRs and control fields");
+        const auto valid=sample;
+        sample.InterruptedRip^=1;
+        require(!nu::interruptedContext(sample,kernel,recovered,error),"machine RIP mismatch rejected");
+        sample=valid; sample.NmiBytes[sample.Nmi.Size-40-0x170]^=1;
+        require(!nu::interruptedContext(sample,kernel,recovered,error),"Ki return mismatch rejected");
+        sample=valid; sample.NmiBytes[sample.Nmi.Size-40-0x2b0]^=1;
+        require(!nu::interruptedContext(sample,kernel,recovered,error),"Kx return mismatch rejected");
+        sample=valid; sample.Flags|=NU_F_NMI_TRUNCATED;
+        require(!nu::interruptedContext(sample,kernel,recovered,error),"truncated NMI rejected");
+        sample=valid; sample.Nmi.Size=40;
+        require(!nu::interruptedContext(sample,kernel,recovered,error),"missing register saves rejected");
+        sample=valid; sample.KernelBase+=0x1000;
+        require(!nu::interruptedContext(sample,kernel,recovered,error),"kernel base mismatch rejected");
+        sample=valid; kernel.Timestamp^=1;
+        require(!nu::interruptedContext(sample,kernel,recovered,error),"kernel revision mismatch rejected");
+        std::cout << "Context tests passed: all GPRs, original RSI, handler returns, target identity, and truncation.\n";
         std::cout << "Reader tests passed: identity, sections, unwind table, machine-frame metadata,\n"
                      "snapshot translation, malformed images, and missing-memory boundaries.\n";
         return 0;
