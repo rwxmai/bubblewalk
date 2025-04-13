@@ -35,6 +35,12 @@ Frame ModuleMap::classify(uint64_t pc,uint64_t sp,uint32_t depth) const {
     Frame f{pc,pc,sp,depth,FrameKind::Invalid,{}};
     if(!kernel(pc)||!kernel(sp)||(sp&7))return f;
     auto m=owner(pc);
+    if(depth&&(!m||(m->Image&&!m->Image->executable(pc-m->Base)))) {
+        auto previous=owner(pc-1);
+        if(previous&&previous->Image&&previous->Image->executable(pc-1-previous->Base)) {
+            m=previous;f.LookupPc=pc-1;
+        }
+    }
     if(!m){f.Kind=FrameKind::OutsideModules;return f;}
     f.Image=m->Name;
     if(!m->Image){f.Kind=FrameKind::MissingImage;return f;}

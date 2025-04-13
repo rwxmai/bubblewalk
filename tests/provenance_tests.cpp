@@ -19,6 +19,9 @@ int main() {
         check(map.classify(base+0x1010,sp,0).Kind==K::ImageCode,"ordinary code");
         check(map.classify(base+0x9000,sp,0).Kind==K::OutsideModules,"standalone unowned RIP");
         check(map.classify(base+0x2010,sp,0).Kind==K::NonExecutableImage,"RIP in data");
+        check(map.classify(base+0x9000,sp+40,1).Kind==K::OutsideModules,"unowned caller");
+        auto edge=map.classify(base+0x1400,sp+40,1);
+        check(edge.Kind==K::ImageCode&&edge.Pc==base+0x1400&&edge.LookupPc==base+0x13ff,"caller boundary retains raw PC");
         check(map.classify(base+0x1400,sp,0).Kind==K::NonExecutableImage,"sampled RIP is never biased");
         check(map.classify(base+0x1401,sp+40,1).Kind==K::NonExecutableImage,"one-byte bias cannot span a gap");
         check(map.classify(base+pe.size(),sp,0).Kind==K::OutsideModules,"exclusive module end");
