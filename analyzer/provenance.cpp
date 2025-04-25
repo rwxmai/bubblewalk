@@ -47,4 +47,28 @@ Frame ModuleMap::classify(uint64_t pc,uint64_t sp,uint32_t depth) const {
     f.Kind=m->Image->executable(f.LookupPc-m->Base)?FrameKind::ImageCode:FrameKind::NonExecutableImage;
     return f;
 }
+/* evidence: Emit anomalies without driver names, hashes or reputation */
+Evaluation evaluate(const StackEvidence& e) {
+    Evaluation result;
+    if(!e.ContextRecovered||!e.InventoryStable||e.Frames.empty())return result;
+    for(size_t i=0;i<e.Frames.size();++i)
+        if(e.Frames[i].Depth!=i||e.Frames[i].Kind==FrameKind::Invalid)return result;
+    bool bounded=true;
+    for(const auto& f:e.Frames) {
+        if(f.Kind==FrameKind::MissingImage){bounded=false;break;}
+        if(f.Kind==FrameKind::OutsideModules) {
+            result.Findings.push_back({f.Depth?"NMI_UNOWNED_CALLER":"NMI_UNOWNED_RIP",f});
+            bounded=false;break;
+        }
+        if(f.Kind==FrameKind::NonExecutableImage) {
+            result.Findings.push_back({f.Depth?"NMI_CALLER_OUTSIDE_EXECUTABLE_SECTIONS":
+                                              "NMI_RIP_OUTSIDE_EXECUTABLE_SECTIONS",f});
+            bounded=false;break;
+        }
+    }
+    result.Complete=bounded&&!e.StackTruncated&&e.Stop=="terminal";
+    if(!result.Findings.empty())result.Status="anomaly";
+    else if(result.Complete)result.Status="no_anomaly_in_observed_frames";
+    return result;
+}
 }
