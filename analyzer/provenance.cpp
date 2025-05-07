@@ -8,6 +8,18 @@
 namespace nu {
 namespace {
 bool kernel(uint64_t address) {return address>=0xffff800000000000ull;}
+std::string quote(const std::string& value) {
+    std::ostringstream out;out<<'"';
+    for(unsigned char c:value) {
+        if(c=='"'||c=='\\')out<<'\\'<<c;
+        else if(c<32)out<<"\\u00"<<std::hex<<std::setw(2)<<std::setfill('0')<<unsigned(c);
+        else out<<c;
+    }
+    out<<'"';return out.str();
+}
+std::string address(uint64_t value) {
+    std::ostringstream out;out<<"0x"<<std::hex<<value;return quote(out.str());
+}
 }
 /* modules: Reject wrapped or overlapping ranges before resolving PCs */
 ModuleMap::ModuleMap(std::vector<ModuleView> modules):modules_(std::move(modules)) {
@@ -70,5 +82,24 @@ Evaluation evaluate(const StackEvidence& e) {
     if(!result.Findings.empty())result.Status="anomaly";
     else if(result.Complete)result.Status="no_anomaly_in_observed_frames";
     return result;
+}
+std::string reportJson(const StackEvidence& e,const Evaluation& r) {
+    std::ostringstream out;
+    out<<"{\"event\":\"nmi_stack\",\"cpu\":"<<e.Cpu<<",\"generation\":"<<e.Generation
+       <<",\"tsc\":"<<address(e.Tsc)<<",\"status\":"<<quote(r.Status)
+       <<",\"stop\":"<<quote(e.Stop)<<",\"complete\":"<<(r.Complete?"true":"false")
+       <<",\"context_recovered\":"<<(e.ContextRecovered?"true":"false")
+       <<",\"inventory_stable\":"<<(e.InventoryStable?"true":"false")
+       <<",\"stack_truncated\":"<<(e.StackTruncated?"true":"false")
+       <<",\"frame_count\":"<<e.Frames.size()<<",\"findings\":[";
+    bool first=true;
+    for(const auto& f:r.Findings) {
+        if(!first)out<<',';
+        first=false;
+        out<<"{\"code\":"<<quote(f.Code)<<",\"pc\":"<<address(f.Location.Pc)
+           <<",\"lookup_pc\":"<<address(f.Location.LookupPc)<<",\"sp\":"<<address(f.Location.Sp)
+           <<",\"depth\":"<<f.Location.Depth<<",\"image\":"<<quote(f.Location.Image)<<'}';
+    }
+    out<<"]}";return out.str();
 }
 }

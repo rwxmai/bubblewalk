@@ -27,6 +27,8 @@ int main() {
         e.InventoryStable=true;e.Frames={map.classify(base+0x2010,sp,0)};e.Stop="nonexecutable_image";
         r=nu::evaluate(e);
         check(r.Findings[0].Code=="NMI_RIP_OUTSIDE_EXECUTABLE_SECTIONS","RIP section evidence");
+        auto json=nu::reportJson(e,r);
+        check(json.find("\\\"")!=std::string::npos&&json.find("\\\\")!=std::string::npos&&json.find("\\u000a")!=std::string::npos,"JSON path escaping");
         e.Frames={map.classify(base+0x1010,sp,0),map.classify(base+0x2010,sp+40,1)};
         check(nu::evaluate(e).Findings[0].Code=="NMI_CALLER_OUTSIDE_EXECUTABLE_SECTIONS","caller section evidence");
         e.Frames={map.classify(base+0x1010,sp,0)};e.Stop="terminal";
