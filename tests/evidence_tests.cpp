@@ -1,4 +1,5 @@
 #include "../analyzer/provenance.h"
+#include "../analyzer/demo.h"
 #include "fixture.h"
 #include <iostream>
 #include <sstream>
@@ -45,6 +46,8 @@ int main() {
         nu::ModuleMap missing({{base,pe.size(),"missing.sys",nullptr}});
         e.Frames={missing.classify(base+0x1010,sp,0)};
         check(nu::evaluate(e).Status=="incomplete","missing metadata is not execution outside an image");
+        std::ostringstream replay;nu::runNmiDemo(replay);
+        check(replay.str().find("data_only_indistinguishable")!=std::string::npos,"data-only negative control");
         std::cout<<"NMI evidence passed: independent anomalies, coverage gates, JSON and replay controls.\n";
         return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}
