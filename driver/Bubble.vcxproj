@@ -46,6 +46,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="driver.c" />
+    <MASM Include="capture.asm" />
     <ClInclude Include="..\include\protocol.h" />
     <ClInclude Include="..\include\target_26100_1.h" />
   </ItemGroup>

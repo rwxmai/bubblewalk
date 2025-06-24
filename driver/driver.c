@@ -40,6 +40,144 @@ static NU_DEVICE gNu;
 static const GUID NuDeviceGuid =
     {0x8b973c74,0x23d1,0x4c10,{0xac,0x35,0x02,0xc1,0xa9,0x27,0x13,0x43}};
 
+static BOOLEAN NuKernel(UINT64 Address)
+{
+    /* va: Restrict pointers to canonical LA48 kernel addresses */
+    return Address >= 0xffff800000000000ull;
+}
+
+/* nmi: Copy through volatile byte accesses at HIGH_LEVEL
+ * Avoid compiler-generated SIMD copies and out-of-line CRT helpers.
+ */
+__declspec(noinline) static VOID NuBytes(PVOID To, const VOID* From, SIZE_T Count)
+{
+    volatile UCHAR* d = (volatile UCHAR*)To;
+    const volatile UCHAR* s = (const volatile UCHAR*)From;
+    while (Count--) *d++ = *s++;
+}
+
+/* x64: Locate the five-qword machine frame below the IST top
+ * Resolve IDT[2].IST through TR and the 64-bit TSS descriptor. Assume
+ * the aligned IST top precedes RIP, CS, RFLAGS, RSP, SS by 40 bytes.
+ */
+static BOOLEAN NuMachineFrame(UINT64 EntryRsp, UINT64* Top, UINT64** Frame)
+{
+    NU_TABLES tables;
+    const volatile UCHAR *gate, *desc;
+    UINT64 tss, top;
+    ULONG selector, ist, limit;
+    NuReadTables(&tables);
+    if (!NuKernel(tables.Idt.Base) || !NuKernel(tables.Gdt.Base) ||
+        tables.Idt.Limit < 47 || (tables.Tr & 4)) return FALSE;
+    gate = (const volatile UCHAR*)(ULONG_PTR)(tables.Idt.Base + 2 * 16);
+    if ((gate[5] & 0x9f) != 0x8e) return FALSE;
+    ist = gate[4] & 7;
+    if (!ist) return FALSE;
+    selector = tables.Tr & ~7u;
+    if (selector + 15 > tables.Gdt.Limit) return FALSE;
+    desc = (const volatile UCHAR*)(ULONG_PTR)(tables.Gdt.Base + selector);
+    if (!(desc[5] & 0x80) || (desc[5] & 0x10) ||
+        ((desc[5] & 15) != 9 && (desc[5] & 15) != 11)) return FALSE;
+    limit = desc[0] | ((ULONG)desc[1] << 8) | ((ULONG)(desc[6] & 15) << 16);
+    if (limit < 103 || (desc[6] & 0x80)) return FALSE;
+    tss = desc[2] | ((UINT64)desc[3] << 8) | ((UINT64)desc[4] << 16) |
+        ((UINT64)desc[7] << 24) | ((UINT64)desc[8] << 32) |
+        ((UINT64)desc[9] << 40) | ((UINT64)desc[10] << 48) |
+        ((UINT64)desc[11] << 56);
+    if (!NuKernel(tss)) return FALSE;
+    top = *(volatile UINT64*)(ULONG_PTR)(tss + 36 + (ist - 1) * 8);
+    top &= ~15ull;
+    if (!NuKernel(top) || EntryRsp > top - 40 || top - EntryRsp > 0x10000)
+        return FALSE;
+    *Top = top;
+    *Frame = (UINT64*)(ULONG_PTR)(top - 40);
+    return TRUE;
+}
+
+/* nmi: Confine capture to resident state and nonblocking operations
+ * HIGH_LEVEL cannot service a page fault or wait for a preempted owner.
+ */
+BOOLEAN NuCapture(PVOID Context, BOOLEAN Handled, const NU_REGS* Entry)
+{
+    NU_DEVICE* d = (NU_DEVICE*)Context;
+    NU_SLOT* slot;
+    NU_SAMPLE* s;
+    PROCESSOR_NUMBER number;
+    ULONG cpu, size;
+    UINT64 top, *frame, low, high;
+    LONG previous;
+    InterlockedIncrement(&d->Active);
+    if (!InterlockedCompareExchange(&d->Armed, 0, 0)) {
+        InterlockedDecrement(&d->Active);
+        return Handled;
+    }
+    KeGetCurrentProcessorNumberEx(&number);
+    cpu = KeGetProcessorIndexFromNumber(&number);
+    if (cpu >= d->CpuCount) goto done;
+    slot = &d->Slots[cpu];
+    previous = InterlockedCompareExchange(&slot->State, NU_WRITING, NU_WAITING);
+    if (previous != NU_WAITING) goto done;
+    /* nmi: Populate the zeroed slot acquired by WAITING-to-WRITING CAS */
+    s = &slot->Sample;
+    s->Version = NU_VERSION;
+    s->Cpu = cpu;
+    s->Generation = (ULONG)InterlockedCompareExchange(&d->Generation, 0, 0);
+    s->Tsc = __rdtsc();
+    s->KernelBase = d->KernelBase;
+    s->Thread = (UINT64)(ULONG_PTR)KeGetCurrentThread();
+    NuBytes(&s->Entry, Entry, sizeof(*Entry));
+    if (!NuMachineFrame(Entry->Rsp, &top, &frame)) {
+        s->Flags |= NU_F_ARCH_INVALID;
+        goto publish;
+    }
+    s->InterruptedRip = frame[0];
+    s->InterruptedCs = frame[1];
+    s->InterruptedFlags = frame[2];
+    s->InterruptedRsp = frame[3];
+    s->Nmi.Base = Entry->Rsp;
+    size = (ULONG)(top - Entry->Rsp);
+    if (size > NU_NMI_BYTES) {
+        size = NU_NMI_BYTES;
+        s->Flags |= NU_F_NMI_TRUNCATED;
+    }
+    s->Nmi.Size = size;
+    NuBytes(s->NmiBytes, (PVOID)(ULONG_PTR)Entry->Rsp, size);
+    if (s->InterruptedCs & 3) {
+        s->Flags |= NU_F_USER_INTERRUPTED;
+        goto publish;
+    }
+    /* nmi: Bound interrupted RSP against KTHREAD StackLimit/StackBase
+     * Alternate stacks outside this interval produce STACK_UNSUPPORTED.
+     */
+    low = *(volatile UINT64*)(ULONG_PTR)(s->Thread + d->LimitOffset);
+    high = *(volatile UINT64*)(ULONG_PTR)(s->Thread + d->BaseOffset);
+    if (!NuKernel(low) || !NuKernel(high) || high <= low || high - low > 0x100000 ||
+        s->InterruptedRsp < low || s->InterruptedRsp >= high ||
+        !NuKernel(s->InterruptedRip) || (s->InterruptedRsp & 7)) {
+        s->Flags |= NU_F_STACK_UNSUPPORTED;
+        goto publish;
+    }
+    s->Stack.Base = s->InterruptedRsp;
+    size = (ULONG)(high - s->InterruptedRsp);
+    if (size > d->CaptureBytes) {
+        size = d->CaptureBytes;
+        s->Flags |= NU_F_THREAD_TRUNCATED;
+    }
+    s->Stack.Size = size;
+    NuBytes(s->StackBytes, (PVOID)(ULONG_PTR)s->Stack.Base, size);
+publish:
+    /* nmi: Publish READY with a full interlocked memory barrier
+     * The reader acquires READY before copying NU_SAMPLE.
+     */
+    InterlockedExchange(&slot->State, NU_READY);
+done:
+    InterlockedDecrement(&d->Active);
+    /* nmi: Return TRUE for callbacks admitted by the armed gate
+     * Source attribution is absent; hardware-fault NMIs are consumed too.
+     */
+    return TRUE;
+}
+
 static NTSTATUS NuComplete(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 {
     Irp->IoStatus.Status = Status;
