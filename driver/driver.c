@@ -178,6 +178,76 @@ done:
     return TRUE;
 }
 
+static NTSTATUS NuDword(HANDLE Key, PCWSTR Name, ULONG* Value)
+{
+    UCHAR bytes[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    PKEY_VALUE_PARTIAL_INFORMATION p = (PKEY_VALUE_PARTIAL_INFORMATION)bytes;
+    UNICODE_STRING name;
+    ULONG length;
+    NTSTATUS status;
+    RtlInitUnicodeString(&name, Name);
+    status = ZwQueryValueKey(Key, &name, KeyValuePartialInformation,
+                            bytes, sizeof(bytes), &length);
+    if (!NT_SUCCESS(status)) return status;
+    if (p->Type != REG_DWORD || p->DataLength != sizeof(ULONG))
+        return STATUS_INVALID_PARAMETER;
+    RtlCopyMemory(Value, p->Data, sizeof(ULONG));
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NuProfile(PUNICODE_STRING RegistryPath)
+{
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING parameters;
+    HANDLE service = NULL, key = NULL;
+    RTL_OSVERSIONINFOW version = {0};
+    NTSTATUS status;
+    ULONG expected = 0, enabled = 0;
+    ULONG_PTR low, high;
+    UINT64 actualLow, actualHigh;
+    version.dwOSVersionInfoSize = sizeof(version);
+    status = RtlGetVersion(&version);
+    if (!NT_SUCCESS(status)) return status;
+    gNu.Build = version.dwBuildNumber;
+    InitializeObjectAttributes(&oa, RegistryPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    status = ZwOpenKey(&service, KEY_READ, &oa);
+    if (!NT_SUCCESS(status)) return status;
+    RtlInitUnicodeString(&parameters, L"Parameters");
+    InitializeObjectAttributes(&oa, &parameters, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               service, NULL);
+    status = ZwOpenKey(&key, KEY_READ, &oa);
+    ZwClose(service);
+    if (!NT_SUCCESS(status)) return status;
+    status = NuDword(key, L"ExpectedBuild", &expected);
+    if (NT_SUCCESS(status)) status = NuDword(key, L"EnableLabCapture", &enabled);
+    if (NT_SUCCESS(status)) status = NuDword(key, L"KthreadStackBaseOffset", &gNu.BaseOffset);
+    if (NT_SUCCESS(status)) status = NuDword(key, L"KthreadStackLimitOffset", &gNu.LimitOffset);
+    gNu.CaptureBytes = NU_THREAD_BYTES;
+    (void)NuDword(key, L"CaptureBytes", &gNu.CaptureBytes);
+    ZwClose(key);
+    if (!NT_SUCCESS(status)) return status;
+    if (version.dwMajorVersion != 10 || version.dwBuildNumber != NU_TARGET_BUILD ||
+        expected != gNu.Build || enabled != 1 ||
+        gNu.BaseOffset != NU_TARGET_STACK_BASE || gNu.LimitOffset != NU_TARGET_STACK_LIMIT ||
+        !gNu.BaseOffset || !gNu.LimitOffset || gNu.BaseOffset > 0x1000 ||
+        gNu.LimitOffset > 0x1000 || (gNu.BaseOffset & 7) || (gNu.LimitOffset & 7) ||
+        gNu.CaptureBytes < 512 || gNu.CaptureBytes > NU_THREAD_BYTES)
+        return STATUS_NOT_SUPPORTED;
+    /* profile: Compare symbol-derived bounds with IoGetStackLimits
+     * This checks the initialization thread, not every stack transition.
+     */
+    IoGetStackLimits(&low, &high);
+    __try {
+        actualLow = *(UINT64*)((UCHAR*)KeGetCurrentThread() + gNu.LimitOffset);
+        actualHigh = *(UINT64*)((UCHAR*)KeGetCurrentThread() + gNu.BaseOffset);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    if (actualLow != low || actualHigh != high) return STATUS_REVISION_MISMATCH;
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS NuComplete(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 {
     Irp->IoStatus.Status = Status;
@@ -238,7 +308,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegistryPath)
 {
     UNICODE_STRING name, link, sddl;
     NTSTATUS status;
-    UNREFERENCED_PARAMETER(RegistryPath);
+    status = NuProfile(RegistryPath);
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "Bubble: build/profile validation failed: %08x\n", status);
+        return status;
+    }
     gNu.CpuCount = KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS);
     KeInitializeMutex(&gNu.ControlLock, 0);
     RtlInitUnicodeString(&name, L"\\Device\\Bubble");
