@@ -248,6 +248,64 @@ static NTSTATUS NuProfile(PUNICODE_STRING RegistryPath)
     return STATUS_SUCCESS;
 }
 
+static BOOLEAN NuCopyKernel(PVOID To, UINT64 From, SIZE_T Length)
+{
+    MM_COPY_ADDRESS source;
+    SIZE_T copied = 0;
+    source.VirtualAddress = (PVOID)(ULONG_PTR)From;
+    return NT_SUCCESS(MmCopyMemory(To, source, Length, MM_COPY_MEMORY_VIRTUAL, &copied)) &&
+           copied == Length;
+}
+
+static NTSTATUS NuModules(PVOID Buffer, ULONG Length, ULONG_PTR* Written)
+{
+    PAUX_MODULE_EXTENDED_INFO modules = NULL;
+    NU_MODULE_HEADER* header = (NU_MODULE_HEADER*)Buffer;
+    NU_MODULE* out = (NU_MODULE*)(header + 1);
+    ULONG size = 0, count, i, attempt;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    for (attempt = 0; attempt < 4; ++attempt) {
+        status = AuxKlibQueryModuleInformation(&size, sizeof(*modules), NULL);
+        if (!NT_SUCCESS(status)) return status;
+        if (!size || size > 4 * 1024 * 1024) return STATUS_INVALID_BUFFER_SIZE;
+        modules = ExAllocatePool2(POOL_FLAG_NON_PAGED, size, NU_TAG);
+        if (!modules) return STATUS_INSUFFICIENT_RESOURCES;
+        status = AuxKlibQueryModuleInformation(&size, sizeof(*modules), modules);
+        if (status != STATUS_BUFFER_TOO_SMALL) break;
+        ExFreePoolWithTag(modules, NU_TAG);
+        modules = NULL;
+    }
+    if (!NT_SUCCESS(status)) goto done;
+    count = size / sizeof(*modules);
+    if (count > 8192 || Length < sizeof(*header) + count * sizeof(*out)) {
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto done;
+    }
+    RtlZeroMemory(Buffer, sizeof(*header) + count * sizeof(*out));
+    header->Count = count;
+    for (i = 0; i < count; ++i) {
+        IMAGE_DOS_HEADER dos;
+        IMAGE_NT_HEADERS64 nt;
+        out[i].Base = (UINT64)(ULONG_PTR)modules[i].BasicInfo.ImageBase;
+        out[i].Size = modules[i].ImageSize;
+        RtlCopyMemory(out[i].Path, modules[i].FullPathName, sizeof(out[i].Path) - 1);
+        if (NuCopyKernel(&dos, out[i].Base, sizeof(dos)) && dos.e_magic == IMAGE_DOS_SIGNATURE &&
+            dos.e_lfanew > 0 && (ULONG)dos.e_lfanew < out[i].Size &&
+            out[i].Size - (ULONG)dos.e_lfanew >= sizeof(nt) &&
+            NuCopyKernel(&nt, out[i].Base + dos.e_lfanew, sizeof(nt)) &&
+            nt.Signature == IMAGE_NT_SIGNATURE &&
+            nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+            out[i].Timestamp = nt.FileHeader.TimeDateStamp;
+            out[i].Checksum = nt.OptionalHeader.CheckSum;
+            out[i].Flags = NU_M_IDENTITY_VALID;
+        }
+    }
+    *Written = sizeof(*header) + count * sizeof(*out);
+done:
+    if (modules) ExFreePoolWithTag(modules, NU_TAG);
+    return status;
+}
+
 static NTSTATUS NuComplete(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 {
     Irp->IoStatus.Status = Status;
@@ -289,6 +347,9 @@ static NTSTATUS NuControl(PDEVICE_OBJECT Device, PIRP Irp)
             written = sizeof(info); status = STATUS_SUCCESS;
         }
         break;
+    case NU_MODULES:
+        status = NuModules(buffer, out, &written);
+        break;
     }
     KeReleaseMutex(&gNu.ControlLock, FALSE);
     return NuComplete(Irp, status, written);
@@ -314,6 +375,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegistryPath)
             "Bubble: build/profile validation failed: %08x\n", status);
         return status;
     }
+    status = AuxKlibInitialize();
+    if (!NT_SUCCESS(status)) return status;
     gNu.CpuCount = KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS);
     KeInitializeMutex(&gNu.ControlLock, 0);
     RtlInitUnicodeString(&name, L"\\Device\\Bubble");
