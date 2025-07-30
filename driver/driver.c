@@ -306,6 +306,40 @@ done:
     return status;
 }
 
+/* target: Match runtime headers and the pinned NMI save instructions */
+static NTSTATUS NuTargetKernel(VOID)
+{
+    const ULONG capacity = 4 * 1024 * 1024;
+    NU_MODULE_HEADER* header = ExAllocatePool2(POOL_FLAG_NON_PAGED, capacity, NU_TAG);
+    NU_MODULE* modules;
+    ULONG_PTR written = 0;
+    ULONG i, j;
+    NTSTATUS status;
+    UCHAR bytes[96];
+    if (!header) return STATUS_INSUFFICIENT_RESOURCES;
+    status = NuModules(header, capacity, &written);
+    if (!NT_SUCCESS(status)) goto done;
+    modules = (NU_MODULE*)(header + 1);
+    status = STATUS_REVISION_MISMATCH;
+    for (i = 0; i < header->Count; ++i) {
+        if (!(modules[i].Flags & NU_M_IDENTITY_VALID) ||
+            modules[i].Size != NU_TARGET_SIZE || modules[i].Timestamp != NU_TARGET_TIMESTAMP ||
+            modules[i].Checksum != NU_TARGET_CHECKSUM) continue;
+        for (j = 0; j < RTL_NUMBER_OF(NuTargetCode); ++j) {
+            const NU_CODE_CHECK* code = &NuTargetCode[j];
+            if (!NuCopyKernel(bytes, modules[i].Base + code->Rva, code->Size) ||
+                RtlCompareMemory(bytes, code->Bytes, code->Size) != code->Size) break;
+        }
+        if (j != RTL_NUMBER_OF(NuTargetCode)) break;
+        gNu.KernelBase = modules[i].Base;
+        status = STATUS_SUCCESS;
+        break;
+    }
+done:
+    ExFreePoolWithTag(header, NU_TAG);
+    return status;
+}
+
 static NTSTATUS NuComplete(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 {
     Irp->IoStatus.Status = Status;
@@ -376,6 +410,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegistryPath)
         return status;
     }
     status = AuxKlibInitialize();
+    if (!NT_SUCCESS(status)) return status;
+    status = NuTargetKernel();
     if (!NT_SUCCESS(status)) return status;
     gNu.CpuCount = KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS);
     KeInitializeMutex(&gNu.ControlLock, 0);
