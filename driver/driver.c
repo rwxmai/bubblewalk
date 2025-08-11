@@ -178,6 +178,25 @@ done:
     return TRUE;
 }
 
+static VOID NuTimeout(KDPC* Dpc, PVOID Context, PVOID A, PVOID B)
+{
+    UNREFERENCED_PARAMETER(Dpc); UNREFERENCED_PARAMETER(A); UNREFERENCED_PARAMETER(B);
+    InterlockedExchange(&((NU_DEVICE*)Context)->Armed, 0);
+}
+
+/* capture: Close admission before waiting for active callbacks
+ * NuCapture increments Active before reading Armed. Interlocked ordering
+ * keeps every callback admitted by the old gate inside this rundown.
+ */
+static VOID NuStop(VOID)
+{
+    LARGE_INTEGER pause;
+    InterlockedExchange(&gNu.Armed, 0);
+    pause.QuadPart = -10000;
+    while (InterlockedCompareExchange(&gNu.Active, 0, 0))
+        KeDelayExecutionThread(KernelMode, FALSE, &pause);
+}
+
 static NTSTATUS NuDword(HANDLE Key, PCWSTR Name, ULONG* Value)
 {
     UCHAR bytes[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
@@ -381,6 +400,45 @@ static NTSTATUS NuControl(PDEVICE_OBJECT Device, PIRP Irp)
             written = sizeof(info); status = STATUS_SUCCESS;
         }
         break;
+    case NU_ARM:
+        if (InterlockedCompareExchange(&gNu.Armed, 0, 0) ||
+            InterlockedCompareExchange(&gNu.Active, 0, 0)) {
+            status = STATUS_DEVICE_BUSY; break;
+        }
+        for (i = 0; i < gNu.CpuCount; ++i) {
+            LONG state = InterlockedCompareExchange(&gNu.Slots[i].State, 0, 0);
+            if (state == NU_READY || state == NU_WRITING || state == NU_READING) break;
+        }
+        if (i != gNu.CpuCount) { status = STATUS_DEVICE_BUSY; break; }
+        KeCancelTimer(&gNu.Timer);
+        KeFlushQueuedDpcs();
+        for (i = 0; i < gNu.CpuCount; ++i) {
+            RtlZeroMemory(&gNu.Slots[i].Sample, sizeof(NU_SAMPLE));
+            InterlockedExchange(&gNu.Slots[i].State, NU_WAITING);
+        }
+        InterlockedIncrement(&gNu.Generation);
+        InterlockedExchange(&gNu.Armed, 1);
+        due.QuadPart = -10 * 1000 * 1000 * 10ll;
+        KeSetTimer(&gNu.Timer, due, &gNu.TimeoutDpc);
+        status = STATUS_SUCCESS;
+        break;
+    case NU_DISARM:
+        NuStop();
+        status = STATUS_SUCCESS;
+        break;
+    case NU_READ:
+        if (in < sizeof(cpu) || out < sizeof(NU_SAMPLE)) {
+            status = STATUS_BUFFER_TOO_SMALL; break;
+        }
+        RtlCopyMemory(&cpu, buffer, sizeof(cpu));
+        if (cpu >= gNu.CpuCount) { status = STATUS_INVALID_PARAMETER; break; }
+        if (InterlockedCompareExchange(&gNu.Slots[cpu].State, NU_READING, NU_READY) != NU_READY) {
+            status = STATUS_NO_MORE_ENTRIES; break;
+        }
+        RtlCopyMemory(buffer, &gNu.Slots[cpu].Sample, sizeof(NU_SAMPLE));
+        InterlockedExchange(&gNu.Slots[cpu].State, NU_EMPTY);
+        written = sizeof(NU_SAMPLE); status = STATUS_SUCCESS;
+        break;
     case NU_MODULES:
         status = NuModules(buffer, out, &written);
         break;
@@ -392,10 +450,21 @@ static NTSTATUS NuControl(PDEVICE_OBJECT Device, PIRP Irp)
 static VOID NuUnload(PDRIVER_OBJECT Driver)
 {
     UNICODE_STRING link;
+    LARGE_INTEGER pause;
+    NTSTATUS status;
     UNREFERENCED_PARAMETER(Driver);
+    InterlockedExchange(&gNu.Armed, 0);
+    KeCancelTimer(&gNu.Timer);
+    KeFlushQueuedDpcs();
+    status = KeDeregisterNmiCallback(gNu.NmiHandle);
+    NT_ASSERT(NT_SUCCESS(status));
+    pause.QuadPart = -10000;
+    while (InterlockedCompareExchange(&gNu.Active, 0, 0))
+        KeDelayExecutionThread(KernelMode, FALSE, &pause);
     RtlInitUnicodeString(&link, L"\\DosDevices\\Bubble");
     IoDeleteSymbolicLink(&link);
     IoDeleteDevice(gNu.Device);
+    ExFreePoolWithTag(gNu.Slots, NU_TAG);
 }
 
 DRIVER_INITIALIZE DriverEntry;
@@ -403,6 +472,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegistryPath)
 {
     UNICODE_STRING name, link, sddl;
     NTSTATUS status;
+    SIZE_T bytes;
     status = NuProfile(RegistryPath);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -414,7 +484,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegistryPath)
     status = NuTargetKernel();
     if (!NT_SUCCESS(status)) return status;
     gNu.CpuCount = KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    bytes = (SIZE_T)gNu.CpuCount * sizeof(NU_SLOT);
+    if (!bytes || bytes > 128 * 1024 * 1024) return STATUS_INSUFFICIENT_RESOURCES;
+    gNu.Slots = ExAllocatePool2(POOL_FLAG_NON_PAGED, bytes, NU_TAG);
+    if (!gNu.Slots) return STATUS_INSUFFICIENT_RESOURCES;
     KeInitializeMutex(&gNu.ControlLock, 0);
+    KeInitializeTimer(&gNu.Timer);
+    KeInitializeDpc(&gNu.TimeoutDpc, NuTimeout, &gNu);
     RtlInitUnicodeString(&name, L"\\Device\\Bubble");
     RtlInitUnicodeString(&link, L"\\DosDevices\\Bubble");
     RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
@@ -426,11 +502,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegistryPath)
     Driver->MajorFunction[IRP_MJ_CREATE] = NuCreateClose;
     Driver->MajorFunction[IRP_MJ_CLOSE] = NuCreateClose;
     Driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = NuControl;
+    gNu.NmiHandle = KeRegisterNmiCallback(NuNmiEntry, &gNu);
+    if (!gNu.NmiHandle) { status = STATUS_INSUFFICIENT_RESOURCES; goto fail_link; }
     Driver->DriverUnload = NuUnload;
     gNu.Device->Flags &= ~DO_DEVICE_INITIALIZING;
     return STATUS_SUCCESS;
+fail_link:
+    IoDeleteSymbolicLink(&link);
 fail_device:
     IoDeleteDevice(gNu.Device);
 fail:
+    ExFreePoolWithTag(gNu.Slots, NU_TAG);
     return status;
 }
