@@ -107,12 +107,95 @@ void checkIdentity(const NU_MODULE& m, const nu::PeImage& pe) {
         throw std::runtime_error("PE identity mismatch or missing runtime identity");
 }
 
+Capture takeCapture(const fs::path& output) {
+    Handle device;
+    device.value = CreateFileW(NU_DEVICE_PATH, GENERIC_READ | GENERIC_WRITE,
+                               0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (device.value == INVALID_HANDLE_VALUE) failWin("open Bubble (administrator required)");
+    Capture c;
+    NU_INFO_DATA info{};
+    DWORD count = 0;
+    if (!ioctl(device.value, NU_INFO, nullptr, 0, &info, sizeof(info), count)) failWin("info");
+    if (count != sizeof(info) || info.Version != NU_VERSION || info.SampleSize != sizeof(NU_SAMPLE))
+        throw std::runtime_error("driver/client protocol mismatch");
+    if (!info.CpuCount || info.CpuCount > 4096) throw std::runtime_error("invalid processor count");
+    c.Modules = modules(device.value);
+    std::cout << "Build " << info.Build << ", " << info.CpuCount
+              << " possible CPUs, thread snapshot cap=" << info.CaptureBytes << " bytes.\n"
+              << "Press Enter to arm for 10 seconds; inject ONE NMI from the VM host during that window.\n";
+    std::cin.get();
+    if (!ioctl(device.value, NU_ARM, nullptr, 0, nullptr, 0, count)) failWin("arm");
+    struct Disarm {
+        HANDLE h;
+        ~Disarm() { DWORD n; DeviceIoControl(h, NU_DISARM, nullptr, 0, nullptr, 0, &n, nullptr); }
+    } disarm{device.value};
+    std::cout << "ARMED: inject now.\n" << std::flush;
+    ULONGLONG start = GetTickCount64();
+    while (GetTickCount64() - start < 10200) {
+        for (uint32_t cpu = 0; cpu < info.CpuCount; ++cpu) {
+            auto s = std::make_unique<NU_SAMPLE>();
+            if (ioctl(device.value, NU_READ, &cpu, sizeof(cpu), s.get(), sizeof(*s), count)) {
+                if (count != sizeof(*s) || s->Version != NU_VERSION)
+                    throw std::runtime_error("invalid sample response");
+                c.Samples.push_back(*s);
+            } else if (GetLastError() != ERROR_NO_MORE_ITEMS && GetLastError() != ERROR_NO_MORE_FILES) {
+                failWin("read sample");
+            }
+        }
+        if (!c.Samples.empty()) break;
+        Sleep(20);
+    }
+    /* capture: Drain only after the driver completes callback rundown */
+    if (!ioctl(device.value, NU_DISARM, nullptr, 0, nullptr, 0, count)) failWin("disarm");
+    for (uint32_t cpu = 0; cpu < info.CpuCount; ++cpu) {
+        auto s = std::make_unique<NU_SAMPLE>();
+        if (ioctl(device.value, NU_READ, &cpu, sizeof(cpu), s.get(), sizeof(*s), count)) {
+            if (count != sizeof(*s) || s->Version != NU_VERSION)
+                throw std::runtime_error("invalid drained sample");
+            c.Samples.push_back(*s);
+        } else if (GetLastError() != ERROR_NO_MORE_ITEMS && GetLastError() != ERROR_NO_MORE_FILES) {
+            failWin("drain sample");
+        }
+    }
+    auto after = modules(device.value);
+    c.Header = {NU_MAGIC, NU_VERSION, info.Build, uint32_t(c.Modules.size()),
+                uint32_t(c.Samples.size()), sizeof(NU_SAMPLE), 0, 0};
+    c.Header.InventoryStable = c.Modules.size() == after.size() &&
+        std::equal(c.Modules.begin(), c.Modules.end(), after.begin(),
+            [](const NU_MODULE& a, const NU_MODULE& b) { return std::memcmp(&a, &b, sizeof(a)) == 0; });
+    if (!c.Header.InventoryStable)
+        std::cerr << "Module inventory changed: attribution is incomplete.\n";
+    fs::create_directories(fs::path(output.wstring() + L".images"));
+    for (const auto& m : c.Modules) {
+        try {
+            auto source = sourcePath(m);
+            checkIdentity(m, nu::PeImage::load(source));
+            auto dest = imagePath(output, m.Base);
+            fs::copy_file(source, dest, fs::copy_options::overwrite_existing);
+            checkIdentity(m, nu::PeImage::load(dest));
+        } catch (const std::exception& e) {
+            std::cerr << "Image unavailable: " << m.Path << ": " << e.what() << "\n";
+        }
+    }
+    std::ofstream file(output, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(&c.Header), sizeof(c.Header));
+    file.write(reinterpret_cast<const char*>(c.Modules.data()),
+               std::streamsize(c.Modules.size() * sizeof(NU_MODULE)));
+    file.write(reinterpret_cast<const char*>(c.Samples.data()),
+               std::streamsize(c.Samples.size() * sizeof(NU_SAMPLE)));
+    if (!file) throw std::runtime_error("cannot write capture");
+    return c;
+}
+
 
 }
 
 int wmain(int argc,wchar_t** argv) {
     try {
         if(argc==2&&std::wstring(argv[1])==L"demo"){nu::runNmiDemo(std::cout);return 0;}
-        std::cerr<<"Usage: bubble demo\n";return 1;
+        if(argc!=3||std::wstring(argv[1])!=L"capture") {
+            std::cerr<<"Usage: bubble capture bubble.nwu | bubble demo\n";return 1;
+        }
+        takeCapture(fs::path(argv[2]));return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}
 }
