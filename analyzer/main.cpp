@@ -187,6 +187,43 @@ Capture takeCapture(const fs::path& output) {
     return c;
 }
 
+Capture loadCapture(const fs::path& path) {
+    Capture c;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) throw std::runtime_error("cannot open capture");
+    auto size = file.tellg();
+    file.seekg(0);
+    if (!file.read(reinterpret_cast<char*>(&c.Header), sizeof(c.Header)))
+        throw std::runtime_error("short capture header");
+    if (c.Header.Magic != NU_MAGIC || c.Header.Version != NU_VERSION ||
+        c.Header.SampleSize != sizeof(NU_SAMPLE) || c.Header.ModuleCount > 8192 ||
+        c.Header.SampleCount > 4096) throw std::runtime_error("invalid capture header");
+    uint64_t expected = sizeof(c.Header) + uint64_t(c.Header.ModuleCount) * sizeof(NU_MODULE) +
+                        uint64_t(c.Header.SampleCount) * sizeof(NU_SAMPLE);
+    if (size < 0 || uint64_t(size) != expected) throw std::runtime_error("capture length mismatch");
+    c.Modules.resize(c.Header.ModuleCount);
+    c.Samples.resize(c.Header.SampleCount);
+    file.read(reinterpret_cast<char*>(c.Modules.data()),
+              std::streamsize(c.Modules.size() * sizeof(NU_MODULE)));
+    file.read(reinterpret_cast<char*>(c.Samples.data()),
+              std::streamsize(c.Samples.size() * sizeof(NU_SAMPLE)));
+    if (!file) throw std::runtime_error("truncated capture");
+    for (auto& m : c.Modules) {
+        if (!m.Size || m.Base < 0xffff800000000000ull ||
+            m.Size > UINT64_MAX - m.Base || !std::memchr(m.Path, 0, sizeof(m.Path)))
+            throw std::runtime_error("invalid module record");
+    }
+    std::sort(c.Modules.begin(), c.Modules.end(), [](const auto& a, const auto& b) { return a.Base < b.Base; });
+    for (size_t i = 1; i < c.Modules.size(); ++i)
+        if (c.Modules[i - 1].Base + c.Modules[i - 1].Size > c.Modules[i].Base)
+            throw std::runtime_error("overlapping module inventory");
+    for (const auto& s : c.Samples)
+        if (s.Version != NU_VERSION || s.Nmi.Size > NU_NMI_BYTES || s.Stack.Size > NU_THREAD_BYTES ||
+            s.Nmi.Size > UINT64_MAX - s.Nmi.Base || s.Stack.Size > UINT64_MAX - s.Stack.Base)
+            throw std::runtime_error("invalid stack record");
+    return c;
+}
+
 
 }
 
