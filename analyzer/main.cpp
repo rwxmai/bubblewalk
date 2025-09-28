@@ -224,6 +224,48 @@ Capture loadCapture(const fs::path& path) {
     return c;
 }
 
+BOOL CALLBACK readMemory(HANDLE, DWORD64 address, PVOID buffer, DWORD size, LPDWORD read) {
+    *read = 0;
+    if (!active || !active->Sample) return FALSE;
+    const auto& s = *active->Sample;
+    bool ok = nu::readRegion(s.Nmi.Base, s.NmiBytes, s.Nmi.Size, address, buffer, size) ||
+              nu::readRegion(s.Stack.Base, s.StackBytes, s.Stack.Size, address, buffer, size);
+    if (!ok) {
+        auto image = active->find(address);
+        ok = image && image->Pe && image->Pe->read(address - image->Module.Base, buffer, size);
+    }
+    if (ok) *read = size;
+    else active->ReadFailed = true;
+    return ok ? TRUE : FALSE;
+}
+BOOL CALLBACK symbolCallback(HANDLE process, ULONG action, ULONG64 data, ULONG64) {
+    if (action != CBA_READ_MEMORY || !data) return FALSE;
+    auto request=reinterpret_cast<PIMAGEHLP_CBA_READ_MEMORY>(data);
+    DWORD localRead=0;
+    return readMemory(process, request->addr, request->buf, request->bytes,
+                      request->bytesread ? request->bytesread : &localRead);
+}
+PVOID CALLBACK functionTable(HANDLE, DWORD64 pc) {
+    auto image = active->find(pc);
+    return image && image->Pe
+        ? const_cast<nu::RuntimeFunction*>(image->Pe->function(pc - image->Module.Base)) : nullptr;
+}
+DWORD64 CALLBACK moduleBase(HANDLE, DWORD64 pc) {
+    auto image = active->find(pc);
+    return image ? image->Module.Base : 0;
+}
+CONTEXT context(const NU_REGS& r) {
+    CONTEXT c{};
+    c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    c.Rax=r.Rax; c.Rcx=r.Rcx; c.Rdx=r.Rdx; c.Rbx=r.Rbx;
+    c.Rsp=r.Rsp; c.Rbp=r.Rbp; c.Rsi=r.Rsi; c.Rdi=r.Rdi;
+    c.R8=r.R8; c.R9=r.R9; c.R10=r.R10; c.R11=r.R11;
+    c.R12=r.R12; c.R13=r.R13; c.R14=r.R14; c.R15=r.R15;
+    c.Rip=r.Rip; c.EFlags=DWORD(r.Rflags);
+    c.SegCs=WORD(r.Cs); c.SegSs=WORD(r.Ss);
+    return c;
+}
+
 
 }
 
