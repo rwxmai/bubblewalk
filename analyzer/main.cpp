@@ -266,15 +266,106 @@ CONTEXT context(const NU_REGS& r) {
     return c;
 }
 
+enum class WalkResult { Complete, Incomplete, OutsideModules, NonExecutable };
+WalkResult walk(Walker& w, const NU_SAMPLE& sample, const NU_REGS& interrupted, bool stable,
+                decltype(&StackWalk64) step = &StackWalk64) {
+    w.Sample=&sample;
+    w.Evidence={sample.Cpu,sample.Generation,sample.Tsc,true,stable,
+                (sample.Flags&NU_F_THREAD_TRUNCATED)!=0,"unwind_failure",{}};
+    std::vector<nu::ModuleView> views;
+    for(const auto& i:w.Images)views.push_back({i.Module.Base,i.Module.Size,i.Module.Path,i.Pe.get()});
+    const nu::ModuleMap map(std::move(views));
+    auto finish=[&](WalkResult result,const char* stop){w.Evidence.Stop=stop;return result;};
+    CONTEXT c=context(interrupted);
+    STACKFRAME64 frame{};
+    frame.AddrPC.Offset=c.Rip;frame.AddrPC.Mode=AddrModeFlat;
+    frame.AddrStack.Offset=c.Rsp;frame.AddrStack.Mode=AddrModeFlat;
+    frame.AddrFrame.Offset=c.Rbp;frame.AddrFrame.Mode=AddrModeFlat;
+    bool initial=true;
+    for(uint32_t depth=0;depth<NU_MAX_FRAMES;++depth) {
+        const uint64_t pc=frame.AddrPC.Offset,sp=frame.AddrStack.Offset;
+        if(!pc) {
+            if(w.Evidence.StackTruncated||!stable)return finish(WalkResult::Incomplete,"terminal_incomplete");
+            return finish(WalkResult::Complete,"terminal");
+        }
+        if(sp<sample.Stack.Base||sp-sample.Stack.Base>sample.Stack.Size)
+            return finish(WalkResult::Incomplete,"stack_bounds");
+        auto observed=map.classify(pc,sp,depth);
+        if(observed.Kind==nu::FrameKind::Invalid)return finish(WalkResult::Incomplete,"invalid_frame");
+        w.Evidence.Frames.push_back(observed);
+        std::cout<<"  "<<depth<<" pc=0x"<<std::hex<<pc<<" sp=0x"<<sp<<std::dec<<" "<<observed.Image<<"\n";
+        if(observed.Kind==nu::FrameKind::OutsideModules)return finish(WalkResult::OutsideModules,"outside_modules");
+        if(observed.Kind==nu::FrameKind::MissingImage)return finish(WalkResult::Incomplete,"missing_image");
+        if(observed.Kind==nu::FrameKind::NonExecutableImage)return finish(WalkResult::NonExecutable,"nonexecutable_image");
+        /* unwind: Retain the current frame before probing for its caller
+         * A TRUE step can survive an optional read miss. A FALSE step
+         * supplies no documented next-frame contract.
+         */
+        for(;;) {
+            w.ReadFailed=false;
+            const BOOL advanced=step(IMAGE_FILE_MACHINE_AMD64,GetCurrentProcess(),GetCurrentThread(),
+                                     &frame,&c,readMemory,functionTable,moduleBase,nullptr);
+            if(!advanced)return finish(WalkResult::Incomplete,w.ReadFailed?"read_failure":"unwind_failure");
+            const bool same=frame.AddrPC.Offset==pc&&frame.AddrStack.Offset==sp;
+            if(same&&initial){initial=false;continue;}
+            initial=false;
+            if(same)return finish(WalkResult::Incomplete,"no_progress");
+            if(frame.AddrStack.Offset<sp)return finish(WalkResult::Incomplete,"stack_regression");
+            break;
+        }
+    }
+    return finish(WalkResult::Incomplete,"frame_limit");
+}
 
+bool analyze(const fs::path& path,const Capture& c) {
+    Walker w;
+    HANDLE process=GetCurrentProcess();
+    SymSetOptions(SYMOPT_FAIL_CRITICAL_ERRORS|SYMOPT_DEFERRED_LOADS|SYMOPT_UNDNAME);
+    if(!SymInitialize(process,nullptr,FALSE))failWin("SymInitialize");
+    struct Cleanup {HANDLE p;~Cleanup(){SymCleanup(p);}} cleanup{process};
+    if(!SymRegisterCallback64(process,symbolCallback,0))failWin("SymRegisterCallback64");
+    for(const auto& module:c.Modules) {
+        Image i;
+        i.Module=module;i.File=imagePath(path,module.Base);
+        try {
+            i.Pe=std::make_unique<nu::PeImage>(nu::PeImage::load(i.File));
+            checkIdentity(module,*i.Pe);
+            /* dbghelp: Resolve names separately from .pdata lookup */
+            SymLoadModuleExW(process,nullptr,i.File.c_str(),nullptr,module.Base,module.Size,nullptr,0);
+        }catch(const std::exception& e){i.Pe.reset();i.Error=e.what();}
+        w.Images.push_back(std::move(i));
+    }
+    if(c.Samples.empty())std::cout<<"NO_SAMPLES: no NMI observation was captured.\n";
+    bool demoObserved=false;
+    active=&w;
+    for(const auto& sample:c.Samples) {
+        w.Evidence={sample.Cpu,sample.Generation,sample.Tsc,false,c.Header.InventoryStable!=0,
+                    (sample.Flags&NU_F_THREAD_TRUNCATED)!=0,"context_unavailable",{}};
+        auto kernel=w.find(sample.KernelBase);
+        if(sample.Flags&NU_F_USER_INTERRUPTED)w.Evidence.Stop="user_context";
+        else if(c.Header.Build!=NU_TARGET_BUILD||!kernel||!kernel->Pe||!nu::targetImage(*kernel->Pe))
+            w.Evidence.Stop="target_mismatch";
+        else {
+            NU_REGS interrupted{};std::string error;
+            if(!nu::interruptedContext(sample,kernel->Module,interrupted,error))w.Evidence.Stop="context_"+error;
+            else walk(w,sample,interrupted,c.Header.InventoryStable!=0);
+        }
+        const auto result=nu::evaluate(w.Evidence);
+        std::cout<<nu::reportJson(w.Evidence,result)<<"\n";
+    }
+    active=nullptr;
+    return demoObserved;
+}
 }
 
 int wmain(int argc,wchar_t** argv) {
     try {
         if(argc==2&&std::wstring(argv[1])==L"demo"){nu::runNmiDemo(std::cout);return 0;}
-        if(argc!=3||std::wstring(argv[1])!=L"capture") {
-            std::cerr<<"Usage: bubble capture bubble.nwu | bubble demo\n";return 1;
+        if(argc!=3||(std::wstring(argv[1])!=L"capture"&&std::wstring(argv[1])!=L"analyze")) {
+            std::cerr<<"Usage: bubble capture|analyze bubble.nwu | bubble demo\n";return 1;
         }
-        takeCapture(fs::path(argv[2]));return 0;
+        const fs::path path=argv[2];
+        if(std::wstring(argv[1])==L"capture")takeCapture(path);
+        analyze(path,loadCapture(path));return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}
 }
