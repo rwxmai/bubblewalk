@@ -317,6 +317,135 @@ WalkResult walk(Walker& w, const NU_SAMPLE& sample, const NU_REGS& interrupted, 
     return finish(WalkResult::Incomplete,"frame_limit");
 }
 
+enum class TestStep { ProbeMiss, Terminal, Repeated, Failed };
+TestStep testStepMode=TestStep::Failed;
+/* test: Inject DbgHelp results without coupling probes to frame validity */
+BOOL WINAPI testStep(DWORD, HANDLE, HANDLE, LPSTACKFRAME64 frame, PVOID,
+                      PREAD_PROCESS_MEMORY_ROUTINE64, PFUNCTION_TABLE_ACCESS_ROUTINE64,
+                      PGET_MODULE_BASE_ROUTINE64, PTRANSLATE_ADDRESS_ROUTINE64) {
+    if (testStepMode == TestStep::Failed) return FALSE;
+    if (testStepMode == TestStep::ProbeMiss) {
+        active->ReadFailed=true;
+        frame->AddrPC.Offset=0xfffff80020000020ull;
+        frame->AddrStack.Offset+=40;
+    } else if (testStepMode == TestStep::Terminal) frame->AddrPC.Offset=0;
+    return TRUE;
+}
+
+void selftest() {
+    HANDLE process=GetCurrentProcess();
+    if (!SymInitialize(process, nullptr, FALSE)) failWin("SymInitialize");
+    struct Cleanup { HANDLE p; ~Cleanup() { SymCleanup(p); } } cleanup{process};
+    if (!SymRegisterCallback64(process, symbolCallback, 0)) failWin("SymRegisterCallback64");
+    Walker w;
+    Image image;
+    image.Module.Base=0xfffff80010000000ull;
+    image.Module.Size=0x4000;
+    std::memcpy(image.Module.Path, "synthetic-unwind-fixture", sizeof("synthetic-unwind-fixture"));
+    image.Pe=std::make_unique<nu::PeImage>(nu::PeImage::parse(nu::testImage()));
+    w.Images.push_back(std::move(image));
+    auto sample=std::make_unique<NU_SAMPLE>();
+    sample->Version=NU_VERSION;
+    sample->Entry.Rip=w.Images[0].Module.Base + 0x1010;
+    sample->Entry.Rsp=0xffffa00000008000ull;
+    sample->Entry.Rflags=0x202;
+    sample->Entry.Cs=0x10;
+    sample->Entry.Ss=0x18;
+    sample->Nmi.Base=sample->Entry.Rsp;
+    sample->Nmi.Size=80;
+    sample->Stack.Base=0xffffa00000108000ull;
+    sample->Stack.Size=64;
+    sample->InterruptedRip=w.Images[0].Module.Base + 0x1210;
+    sample->InterruptedRsp=sample->Stack.Base;
+    sample->InterruptedCs=0x10;
+    auto put=[&](uint8_t* b, size_t at, uint64_t value) { std::memcpy(b + at, &value, 8); };
+    put(sample->NmiBytes, 32, w.Images[0].Module.Base + 0x1110);
+    put(sample->NmiBytes, 40, sample->InterruptedRip);
+    put(sample->NmiBytes, 48, 0x10);
+    put(sample->NmiBytes, 56, 0x202);
+    put(sample->NmiBytes, 64, sample->InterruptedRsp);
+    put(sample->NmiBytes, 72, 0x18);
+    put(sample->StackBytes, 32, 0xfffff80020000020ull);
+    NU_REGS seed{};
+    seed.Rip=sample->InterruptedRip; seed.Rsp=sample->InterruptedRsp;
+    seed.Cs=0x10; seed.Ss=0x18; seed.Rflags=0x202;
+    active=&w;
+    auto result=walk(w, *sample, seed, true);
+    active=nullptr;
+    if (result != WalkResult::OutsideModules)
+        throw std::runtime_error("selftest failed: unbacked caller not recovered");
+    const auto callerEvidence=nu::evaluate(w.Evidence);
+    if(callerEvidence.Findings.size()!=1||callerEvidence.Findings[0].Code!="NMI_UNOWNED_CALLER")
+        throw std::runtime_error("selftest failed: caller finding requires no reputation rule");
+    /* test: Cross UWOP_PUSH_MACHFRAME using the captured IST bytes */
+    CONTEXT handler{};
+    handler.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER;
+    handler.Rip=w.Images[0].Module.Base+0x1010;
+    handler.Rsp=sample->Nmi.Base;
+    handler.EFlags=0x202;handler.SegCs=0x10;handler.SegSs=0x18;
+    STACKFRAME64 machine{};
+    machine.AddrPC.Offset=handler.Rip;machine.AddrPC.Mode=AddrModeFlat;
+    machine.AddrStack.Offset=handler.Rsp;machine.AddrStack.Mode=AddrModeFlat;
+    machine.AddrFrame.Mode=AddrModeFlat;
+    bool crossed=false;
+    active=&w;
+    for(unsigned attempt=0;attempt<8;++attempt) {
+        if(!StackWalk64(IMAGE_FILE_MACHINE_AMD64,process,GetCurrentThread(),&machine,&handler,
+                        readMemory,functionTable,moduleBase,nullptr))break;
+        if(machine.AddrPC.Offset==sample->InterruptedRip&&machine.AddrStack.Offset==sample->Stack.Base) {
+            crossed=true;break;
+        }
+    }
+    active=nullptr;
+    if(!crossed)throw std::runtime_error("selftest failed: PUSH_MACHFRAME did not restore RIP/RSP");
+    /* test: Recover a pool return PC from a mapped leaf without .pdata */
+    seed.Rip=w.Images[0].Module.Base+0x1350;
+    put(sample->StackBytes,0,0xfffff80020000020ull);
+    active=&w;
+    result=walk(w,*sample,seed,true);
+    active=nullptr;
+    if(result!=WalkResult::OutsideModules||nu::evaluate(w.Evidence).Findings.empty())
+        throw std::runtime_error("selftest failed: mapped leaf caller was not recovered");
+    put(sample->StackBytes,0,0);
+    seed.Rip=sample->InterruptedRip;
+    /* test: Truncate before the return slot at RSP+0x20 */
+    sample->Stack.Size=16;
+    active=&w;
+    result=walk(w, *sample, seed, true);
+    active=nullptr;
+    if (result != WalkResult::Incomplete)
+        throw std::runtime_error("selftest failed: truncated stack produced a detection");
+    sample->Stack.Size=64;
+    /* test: Classify an unknown sampled RIP before any unwind probe */
+    seed.Rip=0xfffff80020000020ull;
+    active=&w;
+    result=walk(w, *sample, seed, true);
+    active=nullptr;
+    if (result != WalkResult::OutsideModules)
+        throw std::runtime_error("selftest failed: sampled unbacked RIP was suppressed");
+    const auto ripEvidence=nu::evaluate(w.Evidence);
+    if(ripEvidence.Findings.size()!=1||ripEvidence.Findings[0].Code!="NMI_UNOWNED_RIP")
+        throw std::runtime_error("selftest failed: standalone RIP finding");
+    seed.Rip=sample->InterruptedRip;
+    for (auto mode : {TestStep::ProbeMiss, TestStep::Terminal, TestStep::Repeated, TestStep::Failed}) {
+        testStepMode=mode;
+        active=&w;
+        result=walk(w, *sample, seed, true, testStep);
+        active=nullptr;
+        const auto expected=mode == TestStep::ProbeMiss ? WalkResult::OutsideModules :
+                            mode == TestStep::Terminal ? WalkResult::Complete : WalkResult::Incomplete;
+        if (result != expected) throw std::runtime_error("selftest failed: step result classification");
+    }
+    sample->Flags|=NU_F_THREAD_TRUNCATED;
+    testStepMode=TestStep::Terminal;
+    active=&w;
+    result=walk(w, *sample, seed, true, testStep);
+    active=nullptr;
+    if (result != WalkResult::Incomplete)
+        throw std::runtime_error("selftest failed: truncated terminal context reported complete");
+    std::cout << "SELFTEST_PASSED: caller attribution, read probes, terminal state, no progress, and truncation.\n";
+}
+
 bool analyze(const fs::path& path,const Capture& c) {
     Walker w;
     HANDLE process=GetCurrentProcess();
@@ -361,6 +490,7 @@ bool analyze(const fs::path& path,const Capture& c) {
 int wmain(int argc,wchar_t** argv) {
     try {
         if(argc==2&&std::wstring(argv[1])==L"demo"){nu::runNmiDemo(std::cout);return 0;}
+        if(argc==2&&std::wstring(argv[1])==L"selftest"){selftest();return 0;}
         if(argc!=3||(std::wstring(argv[1])!=L"capture"&&std::wstring(argv[1])!=L"analyze")) {
             std::cerr<<"Usage: bubble capture|analyze bubble.nwu | bubble demo\n";return 1;
         }
