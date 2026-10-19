@@ -6,6 +6,9 @@
 #include "pe_image.h"
 #include "interrupted_context.h"
 #include "provenance.h"
+#include "ioctl_observer.h"
+#include "../include/ioctl_26100_1.h"
+#include <random>
 #include "demo.h"
 #include <atomic>
 #include <thread>
@@ -27,7 +30,14 @@ namespace fs = std::filesystem;
 namespace {
 struct Handle {
     HANDLE value = INVALID_HANDLE_VALUE;
-    ~Handle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    Handle()=default;
+    Handle(const Handle&)=delete;
+    Handle& operator=(const Handle&)=delete;
+    ~Handle() {
+        const auto error=GetLastError();
+        if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);
+        SetLastError(error);
+    }
 };
 struct Capture {
     NU_FILE_HEADER Header{};
@@ -44,6 +54,7 @@ struct Walker {
     const NU_SAMPLE* Sample = nullptr;
     std::vector<Image> Images;
     bool ReadFailed = false;
+    bool Verbose = true;
     nu::StackEvidence Evidence;
     Image* find(uint64_t pc) {
         for (auto& i : Images)
@@ -58,7 +69,13 @@ void failWin(const char* message) {
     throw std::runtime_error(std::string(message) + ": Win32=" + std::to_string(GetLastError()));
 }
 bool ioctl(HANDLE h, DWORD code, void* in, DWORD ins, void* out, DWORD outs, DWORD& count) {
-    return DeviceIoControl(h, code, in, ins, out, outs, &count, nullptr) != FALSE;
+    Handle event;
+    event.value=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    if(!event.value){event.value=INVALID_HANDLE_VALUE;return false;}
+    OVERLAPPED pending{};pending.hEvent=event.value;
+    const BOOL done=DeviceIoControl(h,code,in,ins,out,outs,&count,&pending);
+    if(!done&&GetLastError()!=ERROR_IO_PENDING)return false;
+    return GetOverlappedResult(h,&pending,&count,TRUE)!=FALSE;
 }
 std::vector<NU_MODULE> modules(HANDLE h) {
     std::vector<uint8_t> buffer(4 * 1024 * 1024);
@@ -110,7 +127,7 @@ void checkIdentity(const NU_MODULE& m, const nu::PeImage& pe) {
 Capture takeCapture(const fs::path& output) {
     Handle device;
     device.value = CreateFileW(NU_DEVICE_PATH, GENERIC_READ | GENERIC_WRITE,
-                               0, nullptr, OPEN_EXISTING, 0, nullptr);
+                               0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
     if (device.value == INVALID_HANDLE_VALUE) failWin("open Bubble (administrator required)");
     Capture c;
     NU_INFO_DATA info{};
@@ -127,7 +144,7 @@ Capture takeCapture(const fs::path& output) {
     if (!ioctl(device.value, NU_ARM, nullptr, 0, nullptr, 0, count)) failWin("arm");
     struct Disarm {
         HANDLE h;
-        ~Disarm() { DWORD n; DeviceIoControl(h, NU_DISARM, nullptr, 0, nullptr, 0, &n, nullptr); }
+        ~Disarm() { DWORD n; ioctl(h, NU_DISARM, nullptr, 0, nullptr, 0, n); }
     } disarm{device.value};
     std::cout << "ARMED: inject now.\n" << std::flush;
     ULONGLONG start = GetTickCount64();
@@ -293,7 +310,7 @@ WalkResult walk(Walker& w, const NU_SAMPLE& sample, const NU_REGS& interrupted, 
         auto observed=map.classify(pc,sp,depth);
         if(observed.Kind==nu::FrameKind::Invalid)return finish(WalkResult::Incomplete,"invalid_frame");
         w.Evidence.Frames.push_back(observed);
-        std::cout<<"  "<<depth<<" pc=0x"<<std::hex<<pc<<" sp=0x"<<sp<<std::dec<<" "<<observed.Image<<"\n";
+        if(w.Verbose)std::cout<<"  "<<depth<<" pc=0x"<<std::hex<<pc<<" sp=0x"<<sp<<std::dec<<" "<<observed.Image<<"\n";
         if(observed.Kind==nu::FrameKind::OutsideModules)return finish(WalkResult::OutsideModules,"outside_modules");
         if(observed.Kind==nu::FrameKind::MissingImage)return finish(WalkResult::Incomplete,"missing_image");
         if(observed.Kind==nu::FrameKind::NonExecutableImage)return finish(WalkResult::NonExecutable,"nonexecutable_image");
@@ -446,7 +463,7 @@ void selftest() {
     std::cout << "SELFTEST_PASSED: caller attribution, read probes, terminal state, no progress, and truncation.\n";
 }
 
-bool analyze(const fs::path& path,const Capture& c) {
+void analyze(const fs::path& path,const Capture& c) {
     Walker w;
     HANDLE process=GetCurrentProcess();
     SymSetOptions(SYMOPT_FAIL_CRITICAL_ERRORS|SYMOPT_DEFERRED_LOADS|SYMOPT_UNDNAME);
@@ -465,7 +482,6 @@ bool analyze(const fs::path& path,const Capture& c) {
         w.Images.push_back(std::move(i));
     }
     if(c.Samples.empty())std::cout<<"NO_SAMPLES: no NMI observation was captured.\n";
-    bool demoObserved=false;
     active=&w;
     for(const auto& sample:c.Samples) {
         w.Evidence={sample.Cpu,sample.Generation,sample.Tsc,false,c.Header.InventoryStable!=0,
@@ -481,10 +497,14 @@ bool analyze(const fs::path& path,const Capture& c) {
         }
         const auto result=nu::evaluate(w.Evidence);
         std::cout<<nu::reportJson(w.Evidence,result)<<"\n";
+        const auto observation=nu::observeIoctl(sample,w.Evidence,
+            kernel&&kernel->Pe&&nu::ioctlTarget(*kernel->Pe));
+        if(observation.Observed)std::cout<<nu::ioctlJson(sample,observation)<<"\n";
     }
     active=nullptr;
-    return demoObserved;
 }
+
+
 }
 
 int wmain(int argc,wchar_t** argv) {
