@@ -18,6 +18,17 @@
 C_ASSERT(sizeof(NU_REGS) == 160);
 C_ASSERT(sizeof(NU_SAMPLE) == 73992);
 
+/* hal: Reserve the 26100.1 affinity object without importing private types */
+typedef struct NU_AFFINITY {
+    USHORT Count, Size;
+    ULONG Reserved;
+    UINT64 Bitmap[32];
+} NU_AFFINITY;
+C_ASSERT(sizeof(NU_AFFINITY) == 0x108);
+typedef VOID (*NU_INIT_AFFINITY)(PVOID);
+typedef VOID (*NU_ADD_AFFINITY)(PVOID, ULONG);
+typedef VOID (*NU_SEND_NMI)(PVOID);
+
 typedef struct NU_SLOT { volatile LONG State; NU_SAMPLE Sample; } NU_SLOT;
 typedef struct NU_DEVICE {
     PDEVICE_OBJECT Device;
@@ -27,6 +38,11 @@ typedef struct NU_DEVICE {
     UINT64 KernelBase;
     PVOID NmiHandle;
     KMUTEX ControlLock;
+    NU_INIT_AFFINITY InitAffinity;
+    NU_ADD_AFFINITY AddAffinity;
+    NU_SEND_NMI SendNmi;
+    ULONG NextSender, PulseGeneration;
+    UINT64 LastPulse;
     KTIMER Timer;
     KDPC TimeoutDpc;
 } NU_DEVICE;
@@ -360,6 +376,71 @@ done:
     return status;
 }
 
+/* hal: Resolve the private sender only on the pinned kernel */
+static PVOID NuRoutine(PCWSTR Name, ULONG Rva)
+{
+    UNICODE_STRING name;
+    PVOID address;
+    RtlInitUnicodeString(&name, Name);
+    address = MmGetSystemRoutineAddress(&name);
+    return (UINT64)(ULONG_PTR)address == gNu.KernelBase + Rva ? address : NULL;
+}
+
+/* monitor: Rotate the sender and interrupt every other active processor
+ * KeInitializeAffinityEx sets Size=20 on 26100.1. Reject larger groups.
+ * Exclude the issuing CPU so NU_PULSE does not dominate its own sample.
+ */
+static NTSTATUS NuPulse(NU_PULSE_DATA* Result)
+{
+    NU_AFFINITY targets;
+    GROUP_AFFINITY bind = {0}, previous;
+    PROCESSOR_NUMBER number;
+    ULONG index, sender = MAXULONG, count = 0, attempt;
+    UINT64 now = KeQueryInterruptTime();
+    if (!gNu.SendNmi || !gNu.InitAffinity || !gNu.AddAffinity) return STATUS_NOT_SUPPORTED;
+    if (!InterlockedCompareExchange(&gNu.Armed, 0, 0)) return STATUS_DEVICE_NOT_READY;
+    if (gNu.PulseGeneration == (ULONG)gNu.Generation ||
+        (gNu.LastPulse && now - gNu.LastPulse < NU_PULSE_MIN_MS * 10000ull))
+        return STATUS_DEVICE_BUSY;
+    for (attempt = 0; attempt < gNu.CpuCount; ++attempt) {
+        index = (gNu.NextSender + attempt) % gNu.CpuCount;
+        if (NT_SUCCESS(KeGetProcessorNumberFromIndex(index, &number)) && number.Group < 20 &&
+            number.Number < 64 &&
+            (KeQueryGroupAffinity(number.Group) & (1ull << number.Number))) {
+            sender = index; break;
+        }
+    }
+    if (sender == MAXULONG) return STATUS_NOT_SUPPORTED;
+    bind.Group = number.Group;
+    bind.Mask = 1ull << number.Number;
+    RtlZeroMemory(&targets, sizeof(targets));
+    gNu.InitAffinity(&targets);
+    if (targets.Size != 20) return STATUS_REVISION_MISMATCH;
+    for (index = 0; index < gNu.CpuCount; ++index) {
+        if (!NT_SUCCESS(KeGetProcessorNumberFromIndex(index, &number))) continue;
+        if (number.Group >= targets.Size) return STATUS_NOT_SUPPORTED;
+        if (index != sender && number.Number < 64 &&
+            (KeQueryGroupAffinity(number.Group) & (1ull << number.Number))) {
+            gNu.AddAffinity(&targets, index); ++count;
+        }
+    }
+    if (!count) return STATUS_NOT_SUPPORTED;
+    gNu.NextSender = (sender + 1) % gNu.CpuCount;
+    gNu.PulseGeneration = (ULONG)gNu.Generation;
+    gNu.LastPulse = now;
+    Result->Generation = (ULONG)gNu.Generation;
+    Result->SenderCpu = sender;
+    Result->TargetCount = count;
+    KeSetSystemGroupAffinityThread(&bind, &previous);
+    if (!InterlockedCompareExchange(&gNu.Armed, 0, 0)) {
+        KeRevertToUserGroupAffinityThread(&previous);
+        return STATUS_DEVICE_NOT_READY;
+    }
+    gNu.SendNmi(&targets);
+    KeRevertToUserGroupAffinityThread(&previous);
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS NuComplete(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 {
     Irp->IoStatus.Status = Status;
@@ -371,6 +452,18 @@ static NTSTATUS NuComplete(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 static NTSTATUS NuCreateClose(PDEVICE_OBJECT Device, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Device);
+    return NuComplete(Irp, STATUS_SUCCESS, 0);
+}
+
+static NTSTATUS NuCleanup(PDEVICE_OBJECT Device, PIRP Irp)
+{
+    UNREFERENCED_PARAMETER(Device);
+    (void)KeWaitForSingleObject(&gNu.ControlLock, Executive, KernelMode, FALSE, NULL);
+    NuStop();
+    KeCancelTimer(&gNu.Timer);
+    KeFlushQueuedDpcs();
+    for (ULONG i = 0; i < gNu.CpuCount; ++i) InterlockedExchange(&gNu.Slots[i].State, NU_EMPTY);
+    KeReleaseMutex(&gNu.ControlLock, FALSE);
     return NuComplete(Irp, STATUS_SUCCESS, 0);
 }
 
@@ -389,6 +482,16 @@ static NTSTATUS NuControl(PDEVICE_OBJECT Device, PIRP Irp)
         return NuComplete(Irp, STATUS_INVALID_DEVICE_STATE, 0);
     (void)KeWaitForSingleObject(&gNu.ControlLock, Executive, KernelMode, FALSE, NULL);
     switch (io->Parameters.DeviceIoControl.IoControlCode) {
+    case NU_PULSE:
+        if (in || out != sizeof(NU_PULSE_DATA)) { status = STATUS_INVALID_PARAMETER; break; }
+        {
+            NU_PULSE_DATA result = {0};
+            status = NuPulse(&result);
+            if (NT_SUCCESS(status)) {
+                RtlCopyMemory(buffer, &result, sizeof(result)); written = sizeof(result);
+            }
+        }
+        break;
     case NU_INFO:
         if (out < sizeof(NU_INFO_DATA)) { status = STATUS_BUFFER_TOO_SMALL; break; }
         {
@@ -397,6 +500,7 @@ static NTSTATUS NuControl(PDEVICE_OBJECT Device, PIRP Irp)
             info.CpuCount = gNu.CpuCount; info.SampleSize = sizeof(NU_SAMPLE);
             info.StackBaseOffset = gNu.BaseOffset; info.StackLimitOffset = gNu.LimitOffset;
             info.CaptureBytes = gNu.CaptureBytes;
+            if (gNu.SendNmi && gNu.InitAffinity && gNu.AddAffinity) info.Features |= NU_CAP_PULSE;
             RtlCopyMemory(buffer, &info, sizeof(info));
             written = sizeof(info); status = STATUS_SUCCESS;
         }
@@ -484,6 +588,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegistryPath)
     if (!NT_SUCCESS(status)) return status;
     status = NuTargetKernel();
     if (!NT_SUCCESS(status)) return status;
+    gNu.InitAffinity = (NU_INIT_AFFINITY)NuRoutine(L"KeInitializeAffinityEx", 0x422280);
+    gNu.AddAffinity = (NU_ADD_AFFINITY)NuRoutine(L"KeAddProcessorAffinityEx", 0x2779a0);
+    gNu.SendNmi = (NU_SEND_NMI)NuRoutine(L"HalSendNMI", 0x4d0b10);
     gNu.CpuCount = KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS);
     bytes = (SIZE_T)gNu.CpuCount * sizeof(NU_SLOT);
     if (!bytes || bytes > 128 * 1024 * 1024) return STATUS_INSUFFICIENT_RESOURCES;
@@ -502,6 +609,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegistryPath)
     if (!NT_SUCCESS(status)) goto fail_device;
     Driver->MajorFunction[IRP_MJ_CREATE] = NuCreateClose;
     Driver->MajorFunction[IRP_MJ_CLOSE] = NuCreateClose;
+    Driver->MajorFunction[IRP_MJ_CLEANUP] = NuCleanup;
     Driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = NuControl;
     gNu.NmiHandle = KeRegisterNmiCallback(NuNmiEntry, &gNu);
     if (!gNu.NmiHandle) { status = STATUS_INSUFFICIENT_RESOURCES; goto fail_link; }

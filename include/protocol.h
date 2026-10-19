@@ -15,7 +15,9 @@
 #define NU_READ NU_CTL(0x802u)
 #define NU_MODULES NU_CTL(0x803u)
 #define NU_DISARM NU_CTL(0x804u)
-
+#define NU_PULSE NU_CTL(0x807u)
+#define NU_CAP_PULSE 1u
+#define NU_PULSE_MIN_MS 50u
 #define NU_F_ARCH_INVALID      0x0001u
 #define NU_F_USER_INTERRUPTED  0x0002u
 #define NU_F_STACK_UNSUPPORTED 0x0004u
@@ -30,6 +32,11 @@ typedef struct NU_REGS {
     uint64_t R8, R9, R10, R11, R12, R13, R14, R15;
     uint64_t Rip, Rflags, Cs, Ss;
 } NU_REGS;
+
+/* monitor: Describe the round without claiming complete delivery */
+typedef struct NU_PULSE_DATA {
+    uint32_t Generation, SenderCpu, TargetCount, Reserved;
+} NU_PULSE_DATA;
 
 typedef struct NU_REGION {
     uint64_t Base;
@@ -49,7 +56,7 @@ typedef struct NU_SAMPLE {
 
 typedef struct NU_INFO_DATA {
     uint32_t Version, Build, CpuCount, SampleSize;
-    uint32_t StackBaseOffset, StackLimitOffset, CaptureBytes, Reserved;
+    uint32_t StackBaseOffset, StackLimitOffset, CaptureBytes, Features;
 } NU_INFO_DATA;
 
 typedef struct NU_MODULE {
