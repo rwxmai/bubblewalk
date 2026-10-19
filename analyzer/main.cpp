@@ -504,6 +504,61 @@ void analyze(const fs::path& path,const Capture& c) {
     active=nullptr;
 }
 
+/* test: Unwind the pinned kernel call sites with native DbgHelp
+ * Build only stack bytes; .pdata, chained records and epilog bytes come
+ * from the actual 26100.1 image. No injected StackWalk64 result is used.
+ */
+void ioctlSelftest(const fs::path& kernelPath) {
+    const HANDLE process=GetCurrentProcess();
+    if(!SymInitialize(process,nullptr,FALSE))failWin("SymInitialize");
+    struct Cleanup {HANDLE p;~Cleanup(){active=nullptr;SymCleanup(p);}} cleanup{process};
+    if(!SymRegisterCallback64(process,symbolCallback,0))failWin("SymRegisterCallback64");
+    Walker w;w.Verbose=true;
+    Image kernel;kernel.Module.Base=0xfffff80000000000ull;
+    kernel.Pe=std::make_unique<nu::PeImage>(nu::PeImage::load(kernelPath));
+    if(!nu::targetImage(*kernel.Pe)||!nu::ioctlTarget(*kernel.Pe))
+        throw std::runtime_error("selftest requires the pinned 26100.1 kernel");
+    kernel.Module.Size=kernel.Pe->size();
+    std::memcpy(kernel.Module.Path,"ntoskrnl.exe",13);
+    w.Images.push_back(std::move(kernel));
+    Image driver;driver.Module.Base=0xfffff80100000000ull;driver.Module.Size=0x4000;
+    std::memcpy(driver.Module.Path,"ordinary.sys",13);
+    driver.Pe=std::make_unique<nu::PeImage>(nu::PeImage::parse(nu::testImage()));
+    w.Images.push_back(std::move(driver));
+    auto sample=std::make_unique<NU_SAMPLE>();
+    sample->Version=NU_VERSION;sample->KernelBase=w.Images[0].Module.Base;
+    sample->Stack={0xffff900000010000ull,4096,0};
+    auto qword=[&](uint64_t address,uint64_t value) {
+        std::memcpy(sample->StackBytes+address-sample->Stack.Base,&value,8);
+    };
+    auto dword=[&](uint64_t address,uint32_t value) {
+        std::memcpy(sample->StackBytes+address-sample->Stack.Base,&value,4);
+    };
+    for(bool fast:{false,true}) {
+        std::memset(sample->StackBytes,0,NU_THREAD_BYTES);
+        const uint64_t leaf=sample->Stack.Base+0x100;
+        const uint64_t iof=leaf+8,tail=iof+0x40,iop=fast?leaf+8:tail+0xb0,nt=iop+0x270;
+        const auto k=sample->KernelBase;
+        qword(leaf,k+(fast?NU_IOCTL_FAST_RETURN:NU_IOCTL_DRIVER_RETURN));
+        if(!fast){qword(iof+0x38,k+NU_IOCTL_TAIL_RETURN);qword(tail+0xa8,k+NU_IOCTL_IOP_RETURN);}
+        qword(iop+0x268,k+NU_IOCTL_NT_RETURN);
+        dword(nt+0x28,0x222003);dword(nt+0x98,0x222003);
+        dword(nt+0x38,16);dword(nt+0xa8,16);dword(nt+0x48,32);dword(nt+0xb8,32);
+        dword(nt+0x50,1);
+        NU_REGS seed{};seed.Rip=w.Images[1].Module.Base+0x1350;seed.Rsp=leaf;
+        seed.Rbp=fast?0:tail+0x70;seed.Cs=0x10;seed.Ss=0x18;seed.Rflags=0x202;
+        sample->InterruptedRip=seed.Rip;sample->InterruptedRsp=seed.Rsp;
+        active=&w;walk(w,*sample,seed,true);active=nullptr;
+        const auto result=nu::observeIoctl(*sample,w.Evidence,true);
+        if(!result.Observed||result.Code!=0x222003||result.InputLength!=16||
+           result.OutputLength!=32||result.Image!="ordinary.sys"||
+           result.Path!=(fast?"fast_io_dispatch":"irp_dispatch"))
+            throw std::runtime_error("native IOCTL chain or argument recovery failed");
+        std::cout<<nu::ioctlJson(*sample,result)<<"\n";
+    }
+    std::cout<<"IOCTL_NATIVE_PASSED\n";
+}
+
 std::atomic<HANDLE> monitorStop{nullptr};
 BOOL WINAPI stopMonitor(DWORD signal) {
     if(signal!=CTRL_C_EVENT&&signal!=CTRL_BREAK_EVENT)return FALSE;
@@ -654,6 +709,7 @@ int wmain(int argc,wchar_t** argv) {
     try {
         if(argc==2&&std::wstring(argv[1])==L"replay"){nu::runNmiDemo(std::cout);return 0;}
         if(argc==2&&std::wstring(argv[1])==L"selftest"){selftest();return 0;}
+        if(argc==3&&std::wstring(argv[1])==L"selftest-ioctl"){ioctlSelftest(argv[2]);return 0;}
         if(argc>=2&&(std::wstring(argv[1])==L"monitor"||std::wstring(argv[1])==L"demo")) {
             uint32_t interval=250,rounds=0;bool verbose=false;
             for(int i=2;i<argc;++i) {

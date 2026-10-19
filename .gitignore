@@ -6,3 +6,7 @@
 
 __pycache__/
 *.pyc
+
+/packages/
+/bubble-kernel.exe
+/bubble-capture.obj

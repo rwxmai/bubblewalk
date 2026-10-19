@@ -4,9 +4,37 @@ permissions:
   contents: read
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - run: cmake -S . -B build -A x64
+      - run: python scripts/Generate-CaptureAbi.py --check
+      - name: Assemble the NMI capture boundary
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -version '[17,18)' -property installationPath
+          $setup = Join-Path $vs 'VC/Auxiliary/Build/vcvars64.bat'
+          cmd /c "`"$setup`" && ml64 /nologo /c /Idriver /Fobubble-capture.obj driver/capture.asm"
+          if ($LASTEXITCODE -ne 0) { throw 'MASM capture assembly failed' }
+      - run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
       - run: cmake --build build --config Release
       - run: ctest --test-dir build -C Release --output-on-failure
+      - name: Validate the pinned IOCTL unwind chain
+        shell: pwsh
+        run: |
+          $uri = 'https://msdl.microsoft.com/download/symbols/ntoskrnl.exe/9F2E55B7144e000/ntoskrnl.exe'
+          Invoke-WebRequest $uri -OutFile bubble-kernel.exe
+          $expected = '1cc3b103b25333ee2b79363bb898832a93576befd2e3a29817bd34cf7a3a102b'
+          if ((Get-FileHash bubble-kernel.exe -Algorithm SHA256).Hash.ToLower() -ne $expected) {
+            throw 'Pinned kernel digest mismatch'
+          }
+          & build/Release/bubble.exe selftest-ioctl bubble-kernel.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Native IOCTL unwind failed' }
+      - name: Compile and link the x64 WDM driver
+        shell: pwsh
+        run: |
+          nuget install Microsoft.Windows.WDK.x64 -Version 10.0.26100.1 -OutputDirectory packages -NonInteractive -Source https://api.nuget.org/v3/index.json
+          if ($LASTEXITCODE -ne 0) { throw 'WDK package restore failed' }
+          $vs = & "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -version '[17,18)' -property installationPath
+          $msbuild = Join-Path $vs 'MSBuild/Current/Bin/MSBuild.exe'
+          & $msbuild driver/Bubble.vcxproj /m /p:Configuration=Release /p:Platform=x64 /p:SignMode=Off /p:EnableInf2cat=false
+          if ($LASTEXITCODE -ne 0) { throw 'WDM driver build failed' }

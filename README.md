@@ -4,7 +4,7 @@ Continuous NMI sampling of Windows driver IOCTL dispatch. **bubble.sys** capture
 interrupted CPU state and stack bytes; **bubble.exe** unwinds them and streams
 observations. No driver list, file reputation or IOCTL semantics participate.
 
-Target: **Windows 11 24H2, ntoskrnl 10.0.26100.1, AMD64**, at least two CPUs.
+tested in Win 11 24H2 (ntoskrnl 10.0.26100.1)
 
 ## Run
 

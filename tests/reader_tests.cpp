@@ -16,8 +16,9 @@ static void rejects(std::vector<uint8_t> b, const std::function<void(std::vector
     try { (void)nu::PeImage::parse(b); } catch (const std::exception&) { threw=true; }
     require(threw,"malformed image was accepted");
 }
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2) require(nu::targetImage(nu::PeImage::load(argv[1])),"26100.1 target image/code match");
         auto bytes=nu::testImage();
         auto pe=nu::PeImage::parse(bytes);
         require(pe.size()==0x4000 && pe.timestamp()==0x1234567,"identity parse");
