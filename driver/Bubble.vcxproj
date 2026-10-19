@@ -39,6 +39,7 @@
       <LanguageStandard_C>stdc11</LanguageStandard_C>
       <PreprocessorDefinitions>_AMD64_;AMD64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <MASM><IncludePaths>$(ProjectDir);%(IncludePaths)</IncludePaths></MASM>
     <Link>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
       <AdditionalDependencies>Aux_Klib.lib;Wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -46,6 +47,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="driver.c" />
+    <ClInclude Include="..\include\capture_abi.h" />
+    <None Include="capture_abi.inc" />
     <MASM Include="capture.asm" />
     <ClInclude Include="..\include\protocol.h" />
     <ClInclude Include="..\include\target_26100_1.h" />

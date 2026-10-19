@@ -1,4 +1,5 @@
 #include "interrupted_context.h"
+#include "../include/capture_abi.h"
 #include "../include/target_26100_1.h"
 #include <cstring>
 #include <limits>

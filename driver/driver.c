@@ -4,6 +4,7 @@
 #include <ntimage.h>
 #include <intrin.h>
 #include "../include/protocol.h"
+#include "../include/capture_abi.h"
 #include "../include/target_26100_1.h"
 
 #define NU_TAG 'wUmN'
@@ -34,8 +35,11 @@ typedef struct NU_DTR { USHORT Limit; UINT64 Base; UCHAR Padding[6]; } NU_DTR;
 typedef struct NU_TABLES { NU_DTR Idt, Gdt; USHORT Tr; } NU_TABLES;
 #pragma pack(pop)
 
+extern VOID NuCopyBytes(PVOID To, const VOID* From, SIZE_T Count);
 extern BOOLEAN NuNmiEntry(PVOID Context, BOOLEAN Handled);
 extern VOID NuReadTables(NU_TABLES* Tables);
+C_ASSERT(FIELD_OFFSET(NU_TABLES, Gdt) == 16);
+C_ASSERT(FIELD_OFFSET(NU_TABLES, Tr) == 32);
 static NU_DEVICE gNu;
 static const GUID NuDeviceGuid =
     {0x8b973c74,0x23d1,0x4c10,{0xac,0x35,0x02,0xc1,0xa9,0x27,0x13,0x43}};
@@ -44,16 +48,6 @@ static BOOLEAN NuKernel(UINT64 Address)
 {
     /* va: Restrict pointers to canonical LA48 kernel addresses */
     return Address >= 0xffff800000000000ull;
-}
-
-/* nmi: Copy through volatile byte accesses at HIGH_LEVEL
- * Avoid compiler-generated SIMD copies and out-of-line CRT helpers.
- */
-__declspec(noinline) static VOID NuBytes(PVOID To, const VOID* From, SIZE_T Count)
-{
-    volatile UCHAR* d = (volatile UCHAR*)To;
-    const volatile UCHAR* s = (const volatile UCHAR*)From;
-    while (Count--) *d++ = *s++;
 }
 
 /* x64: Locate the five-qword machine frame below the IST top
@@ -125,7 +119,7 @@ BOOLEAN NuCapture(PVOID Context, BOOLEAN Handled, const NU_REGS* Entry)
     s->Tsc = __rdtsc();
     s->KernelBase = d->KernelBase;
     s->Thread = (UINT64)(ULONG_PTR)KeGetCurrentThread();
-    NuBytes(&s->Entry, Entry, sizeof(*Entry));
+    NuCopyBytes(&s->Entry, Entry, sizeof(*Entry));
     if (!NuMachineFrame(Entry->Rsp, &top, &frame)) {
         s->Flags |= NU_F_ARCH_INVALID;
         goto publish;
@@ -141,7 +135,7 @@ BOOLEAN NuCapture(PVOID Context, BOOLEAN Handled, const NU_REGS* Entry)
         s->Flags |= NU_F_NMI_TRUNCATED;
     }
     s->Nmi.Size = size;
-    NuBytes(s->NmiBytes, (PVOID)(ULONG_PTR)Entry->Rsp, size);
+    NuCopyBytes(s->NmiBytes, (PVOID)(ULONG_PTR)Entry->Rsp, size);
     if (s->InterruptedCs & 3) {
         s->Flags |= NU_F_USER_INTERRUPTED;
         goto publish;
@@ -164,7 +158,7 @@ BOOLEAN NuCapture(PVOID Context, BOOLEAN Handled, const NU_REGS* Entry)
         s->Flags |= NU_F_THREAD_TRUNCATED;
     }
     s->Stack.Size = size;
-    NuBytes(s->StackBytes, (PVOID)(ULONG_PTR)s->Stack.Base, size);
+    NuCopyBytes(s->StackBytes, (PVOID)(ULONG_PTR)s->Stack.Base, size);
 publish:
     /* nmi: Publish READY with a full interlocked memory barrier
      * The reader acquires READY before copying NU_SAMPLE.
