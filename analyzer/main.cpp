@@ -504,18 +504,184 @@ void analyze(const fs::path& path,const Capture& c) {
     active=nullptr;
 }
 
+std::atomic<HANDLE> monitorStop{nullptr};
+BOOL WINAPI stopMonitor(DWORD signal) {
+    if(signal!=CTRL_C_EVENT&&signal!=CTRL_BREAK_EVENT)return FALSE;
+    if(const auto event=monitorStop.load())SetEvent(event);
+    return TRUE;
+}
+
+bool sameModules(const std::vector<NU_MODULE>& a,const std::vector<NU_MODULE>& b) {
+    return a.size()==b.size()&&std::equal(a.begin(),a.end(),b.begin(),
+        [](const auto& x,const auto& y){return std::memcmp(&x,&y,sizeof(x))==0;});
+}
+
+/* monitor: Reuse PE metadata until the sampled module identity changes */
+void refreshImages(Walker& w,const std::vector<NU_MODULE>& inventory) {
+    std::vector<Image> next;
+    for(const auto& module:inventory) {
+        auto found=std::find_if(w.Images.begin(),w.Images.end(),[&](const Image& i) {
+            return !std::memcmp(&i.Module,&module,sizeof(module));
+        });
+        if(found!=w.Images.end()) {next.push_back(std::move(*found));continue;}
+        Image image;image.Module=module;
+        try {
+            image.File=sourcePath(module);
+            image.Pe=std::make_unique<nu::PeImage>(nu::PeImage::load(image.File));
+            checkIdentity(module,*image.Pe);
+        } catch(const std::exception& e) {image.Pe.reset();image.Error=e.what();}
+        next.push_back(std::move(image));
+    }
+    w.Images=std::move(next);
+}
+
+void monitor(uint32_t interval,uint32_t rounds,bool verbose) {
+    Handle stop;
+    stop.value=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    if(!stop.value){stop.value=INVALID_HANDLE_VALUE;failWin("stop event");}
+    monitorStop=stop.value;
+    if(!SetConsoleCtrlHandler(stopMonitor,TRUE)){monitorStop=nullptr;failWin("Ctrl+C handler");}
+    struct ConsoleCleanup {~ConsoleCleanup(){SetConsoleCtrlHandler(stopMonitor,FALSE);monitorStop=nullptr;}} console;
+    Handle device;
+    device.value=CreateFileW(NU_DEVICE_PATH,GENERIC_READ|GENERIC_WRITE,0,nullptr,
+                             OPEN_EXISTING,FILE_FLAG_OVERLAPPED,nullptr);
+    if(device.value==INVALID_HANDLE_VALUE)failWin("open Bubble (administrator required)");
+    DWORD count=0;NU_INFO_DATA info{};
+    if(!ioctl(device.value,NU_INFO,nullptr,0,&info,sizeof(info),count))failWin("info");
+    if(count!=sizeof(info)||info.Version!=NU_VERSION||info.SampleSize!=sizeof(NU_SAMPLE)||
+       info.Build!=NU_TARGET_BUILD||!info.CpuCount||info.CpuCount>4096)
+        throw std::runtime_error("driver/client profile mismatch");
+    if(!(info.Features&NU_CAP_PULSE))throw std::runtime_error("driver lacks the pinned HalSendNMI sender");
+    if(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)<2)throw std::runtime_error("monitor requires at least two active processors");
+    const HANDLE process=GetCurrentProcess();
+    SymSetOptions(SYMOPT_FAIL_CRITICAL_ERRORS|SYMOPT_DEFERRED_LOADS|SYMOPT_UNDNAME);
+    if(!SymInitialize(process,nullptr,FALSE))failWin("SymInitialize");
+    struct Symbols {HANDLE p;~Symbols(){active=nullptr;SymCleanup(p);}} symbols{process};
+    if(!SymRegisterCallback64(process,symbolCallback,0))failWin("SymRegisterCallback64");
+    Walker walker;walker.Verbose=verbose;
+    uint64_t round=0,total=0,observations=0;
+    std::mt19937 jitter(std::random_device{}());
+    std::uniform_int_distribution<uint32_t> extra(0,interval/4);
+    std::cerr<<"MONITOR: periodic NMI capture; Ctrl+C stops. Run the driver workload separately.\n";
+    std::cout<<"{\"event\":\"monitor_started\",\"interval_ms\":"<<interval
+             <<",\"jitter_max_ms\":"<<interval/4<<",\"coverage\":\"sampled\"}\n"<<std::flush;
+    while(WaitForSingleObject(stop.value,0)==WAIT_TIMEOUT&&(!rounds||round<rounds)) {
+        const auto started=GetTickCount64();
+        auto before=modules(device.value);
+        refreshImages(walker,before);
+        bool kernelReady=false;
+        for(const auto& image:walker.Images)
+            if(image.Pe&&nu::targetImage(*image.Pe)&&nu::ioctlTarget(*image.Pe))kernelReady=true;
+        if(!kernelReady)throw std::runtime_error("matching kernel PE and IOCTL profile unavailable");
+        if(!ioctl(device.value,NU_ARM,nullptr,0,nullptr,0,count))failWin("arm");
+        struct RoundCleanup {
+            HANDLE h;bool Armed=true;
+            ~RoundCleanup(){if(Armed){DWORD n=0;ioctl(h,NU_DISARM,nullptr,0,nullptr,0,n);}}
+        } cleanup{device.value};
+        NU_PULSE_DATA pulse{};
+        if(!ioctl(device.value,NU_PULSE,nullptr,0,&pulse,sizeof(pulse),count))failWin("send NMI");
+        if(count!=sizeof(pulse)||!pulse.TargetCount||pulse.TargetCount>=info.CpuCount||
+           pulse.SenderCpu>=info.CpuCount)throw std::runtime_error("invalid pulse response");
+        std::vector<NU_SAMPLE> samples;
+        std::vector<bool> seen(info.CpuCount,false);
+        auto sample=std::make_unique<NU_SAMPLE>();
+        uint32_t received=0;
+        auto drain=[&] {
+            for(uint32_t cpu=0;cpu<info.CpuCount;++cpu) {
+                if(seen[cpu])continue;
+                if(!ioctl(device.value,NU_READ,&cpu,sizeof(cpu),sample.get(),sizeof(*sample),count)) {
+                    const auto error=GetLastError();
+                    if(error==ERROR_NO_MORE_ITEMS||error==ERROR_NO_MORE_FILES)continue;
+                    failWin("read sample");
+                }
+                if(count!=sizeof(*sample)||sample->Version!=NU_VERSION||sample->Cpu!=cpu||
+                   sample->Generation!=pulse.Generation||sample->Stack.Size>NU_THREAD_BYTES||
+                   sample->Nmi.Size>NU_NMI_BYTES)throw std::runtime_error("invalid monitor sample");
+                seen[cpu]=true;samples.push_back(*sample);
+                if(cpu!=pulse.SenderCpu)++received;
+            }
+        };
+        const auto sent=GetTickCount64();
+        do {
+            drain();
+            if(received>=pulse.TargetCount||GetTickCount64()-sent>=100)break;
+            if(WaitForSingleObject(stop.value,1)!=WAIT_TIMEOUT)break;
+        } while(true);
+        if(!ioctl(device.value,NU_DISARM,nullptr,0,nullptr,0,count))failWin("disarm");
+        cleanup.Armed=false;
+        drain();
+        const bool stable=sameModules(before,modules(device.value));
+        uint32_t ioctlCount=0,incomplete=0;
+        active=&walker;
+        for(const auto& item:samples) {
+            walker.Evidence={item.Cpu,item.Generation,item.Tsc,false,stable,
+                (item.Flags&NU_F_THREAD_TRUNCATED)!=0,"context_unavailable",{}};
+            auto kernel=walker.find(item.KernelBase);
+            const bool target=kernel&&kernel->Pe&&nu::targetImage(*kernel->Pe)&&nu::ioctlTarget(*kernel->Pe);
+            if(item.Flags&NU_F_USER_INTERRUPTED)walker.Evidence.Stop="user_context";
+            else if(!target)walker.Evidence.Stop="target_mismatch";
+            else {
+                NU_REGS interrupted{};std::string error;
+                if(!nu::interruptedContext(item,kernel->Module,interrupted,error))walker.Evidence.Stop="context_"+error;
+                else walk(walker,item,interrupted,stable);
+            }
+            const auto observation=nu::observeIoctl(item,walker.Evidence,target);
+            if(observation.Observed){++ioctlCount;std::cout<<nu::ioctlJson(item,observation)<<"\n";}
+            const auto result=nu::evaluate(walker.Evidence);
+            if(result.Status=="incomplete")++incomplete;
+            if(verbose||!result.Findings.empty())std::cout<<nu::reportJson(walker.Evidence,result)<<"\n";
+        }
+        active=nullptr;
+        ++round;total+=samples.size();observations+=ioctlCount;
+        std::cout<<"{\"event\":\"nmi_round\",\"round\":"<<round<<",\"generation\":"<<pulse.Generation
+                 <<",\"sender_cpu\":"<<pulse.SenderCpu<<",\"targeted\":"<<pulse.TargetCount
+                 <<",\"captured\":"<<received<<",\"ioctl_observations\":"<<ioctlCount
+                 <<",\"incomplete_samples\":"<<incomplete<<",\"inventory_stable\":"<<(stable?"true":"false")
+                 <<",\"elapsed_ms\":"<<GetTickCount64()-started<<"}\n"<<std::flush;
+        if(received<pulse.TargetCount&&WaitForSingleObject(stop.value,0)==WAIT_TIMEOUT)
+            throw std::runtime_error("NMI delivery incomplete; stopping before another generation");
+        const auto elapsed=GetTickCount64()-started;
+        const uint64_t delay=interval+extra(jitter);
+        if(elapsed<delay)WaitForSingleObject(stop.value,DWORD(delay-elapsed));
+    }
+    std::cout<<"{\"event\":\"monitor_stopped\",\"rounds\":"<<round<<",\"samples\":"<<total
+             <<",\"ioctl_observations\":"<<observations<<"}\n"<<std::flush;
+}
 
 }
 
 int wmain(int argc,wchar_t** argv) {
     try {
-        if(argc==2&&std::wstring(argv[1])==L"demo"){nu::runNmiDemo(std::cout);return 0;}
+        if(argc==2&&std::wstring(argv[1])==L"replay"){nu::runNmiDemo(std::cout);return 0;}
         if(argc==2&&std::wstring(argv[1])==L"selftest"){selftest();return 0;}
-        if(argc!=3||(std::wstring(argv[1])!=L"capture"&&std::wstring(argv[1])!=L"analyze")) {
-            std::cerr<<"Usage: bubble capture|analyze bubble.nwu | bubble demo\n";return 1;
+        if(argc>=2&&(std::wstring(argv[1])==L"monitor"||std::wstring(argv[1])==L"demo")) {
+            uint32_t interval=250,rounds=0;bool verbose=false;
+            for(int i=2;i<argc;++i) {
+                const std::wstring option=argv[i];
+                if(option==L"--verbose"){verbose=true;continue;}
+                if((option!=L"--interval-ms"&&option!=L"--rounds")||i+1>=argc)
+                    throw std::runtime_error("expected --interval-ms N, --rounds N or --verbose");
+                const std::wstring value=argv[++i];
+                if(value.empty()||value.find_first_not_of(L"0123456789")!=std::wstring::npos)
+                    throw std::runtime_error("expected an unsigned decimal integer");
+                const auto number=std::stoull(value);
+                if(number>UINT32_MAX)throw std::runtime_error("option exceeds uint32");
+                if(option==L"--interval-ms")interval=uint32_t(number);else rounds=uint32_t(number);
+            }
+            if(interval<NU_PULSE_MIN_MS||interval>60000)throw std::runtime_error("interval must be 50..60000 ms");
+            monitor(interval,rounds,verbose);return 0;
         }
+        if(argc<3||argc>4) {
+            std::cerr<<"Usage: bubble monitor [--interval-ms N] [--rounds N] [--verbose]\n"
+                       "       bubble demo (live monitor)\n"
+                       "       bubble capture|analyze bubble.nwu\n"
+                       "       bubble replay | bubble selftest\n";return 1;
+        }
+        const std::wstring command=argv[1];
+        if(argc!=3||(command!=L"capture"&&command!=L"analyze"))throw std::runtime_error("invalid command");
         const fs::path path=argv[2];
-        if(std::wstring(argv[1])==L"capture")takeCapture(path);
-        analyze(path,loadCapture(path));return 0;
-    }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}
+        if(command==L"capture")takeCapture(path);
+        analyze(path,loadCapture(path));
+        return 0;
+    }catch(const std::exception& e){std::cerr<<"Error: "<<e.what()<<"\n";return 1;}
 }
