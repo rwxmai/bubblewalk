@@ -51,6 +51,7 @@
     <None Include="capture_abi.inc" />
     <MASM Include="capture.asm" />
     <ClInclude Include="..\include\protocol.h" />
+    <ClInclude Include="..\include\ioctl_26100_1.h" />
     <ClInclude Include="..\include\target_26100_1.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

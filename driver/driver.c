@@ -6,6 +6,7 @@
 #include "../include/protocol.h"
 #include "../include/capture_abi.h"
 #include "../include/target_26100_1.h"
+#include "../include/ioctl_26100_1.h"
 
 #define NU_TAG 'wUmN'
 #define NU_EMPTY 0
@@ -344,6 +345,12 @@ static NTSTATUS NuTargetKernel(VOID)
                 RtlCompareMemory(bytes, code->Bytes, code->Size) != code->Size) break;
         }
         if (j != RTL_NUMBER_OF(NuTargetCode)) break;
+        for (j = 0; j < RTL_NUMBER_OF(NuIoctlCode); ++j) {
+            const NU_CODE_CHECK* code = &NuIoctlCode[j];
+            if (!NuCopyKernel(bytes, modules[i].Base + code->Rva, code->Size) ||
+                RtlCompareMemory(bytes, code->Bytes, code->Size) != code->Size) break;
+        }
+        if (j != RTL_NUMBER_OF(NuIoctlCode)) break;
         gNu.KernelBase = modules[i].Base;
         status = STATUS_SUCCESS;
         break;
