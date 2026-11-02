@@ -6,7 +6,7 @@
 #include "../include/protocol.h"
 #include "../include/capture_abi.h"
 #include "../include/target_26100_1.h"
-#include "../include/ioctl_26100_1.h"
+#include "../include/ioctl_runtime_26100_1.h"
 
 #define NU_TAG 'wUmN'
 #define NU_EMPTY 0
@@ -336,7 +336,7 @@ done:
     return status;
 }
 
-/* target: Match runtime headers and the pinned NMI save instructions */
+/* target: Match runtime headers, NMI saves and allowed IOCTL loader fixups */
 static NTSTATUS NuTargetKernel(VOID)
 {
     const ULONG capacity = 4 * 1024 * 1024;
@@ -358,19 +358,30 @@ static NTSTATUS NuTargetKernel(VOID)
         for (j = 0; j < RTL_NUMBER_OF(NuTargetCode); ++j) {
             const NU_CODE_CHECK* code = &NuTargetCode[j];
             if (!NuCopyKernel(bytes, modules[i].Base + code->Rva, code->Size) ||
-                RtlCompareMemory(bytes, code->Bytes, code->Size) != code->Size) break;
+                RtlCompareMemory(bytes, code->Bytes, code->Size) != code->Size) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "Bubble: NMI code validation failed at RVA %08x\n", code->Rva);
+                break;
+            }
         }
         if (j != RTL_NUMBER_OF(NuTargetCode)) break;
         for (j = 0; j < RTL_NUMBER_OF(NuIoctlCode); ++j) {
             const NU_CODE_CHECK* code = &NuIoctlCode[j];
             if (!NuCopyKernel(bytes, modules[i].Base + code->Rva, code->Size) ||
-                RtlCompareMemory(bytes, code->Bytes, code->Size) != code->Size) break;
+                !NuIoctlRuntimeCodeMatches(code, bytes)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "Bubble: IOCTL code validation failed at RVA %08x\n", code->Rva);
+                break;
+            }
         }
         if (j != RTL_NUMBER_OF(NuIoctlCode)) break;
         gNu.KernelBase = modules[i].Base;
         status = STATUS_SUCCESS;
         break;
     }
+    if (i == header->Count)
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "Bubble: no loaded image matches the pinned kernel identity\n");
 done:
     ExFreePoolWithTag(header, NU_TAG);
     return status;
@@ -587,7 +598,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegistryPath)
     status = AuxKlibInitialize();
     if (!NT_SUCCESS(status)) return status;
     status = NuTargetKernel();
-    if (!NT_SUCCESS(status)) return status;
+    if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "Bubble: kernel target validation failed: %08x\n", status);
+        return status;
+    }
     gNu.InitAffinity = (NU_INIT_AFFINITY)NuRoutine(L"KeInitializeAffinityEx", 0x422280);
     gNu.AddAffinity = (NU_ADD_AFFINITY)NuRoutine(L"KeAddProcessorAffinityEx", 0x2779a0);
     gNu.SendNmi = (NU_SEND_NMI)NuRoutine(L"HalSendNMI", 0x4d0b10);

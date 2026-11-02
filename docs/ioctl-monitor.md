@@ -18,6 +18,12 @@ The 26100.1 profile accepts adjacent frames, youngest first:
 to that service tail. `86F97E` is the wrapper's return from `IopXxxControlFile`.
 `870004` follows the fast-device-control callback through CFG.
 
+At the dispatch calls returning to `32BF1D` and `870004`, the runtime validator
+accepts the original thunk at RVA `664660` and the pinned kernel's loader
+overrides at `B57780` and `B577E0`. All retain a five-byte CALL and the same
+return PC. Other checked bytes remain exact, and the archived PE must retain
+the original disk bytes. See [loader overrides and load diagnostics](26100.1.md#loader-function-overrides).
+
 The IRP chain's stack deltas must be `40h`, `B0h`, `270h`; the fast-I/O path
 requires `270h` between Iop and Nt. Every frame through the wrapper must have
 valid executable image coverage. Missing suffixes do not erase a verified prefix.

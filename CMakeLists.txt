@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(bubblewalk LANGUAGES CXX)
+project(bubblewalk LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(bubble_core analyzer/pe_image.cpp analyzer/interrupted_context.cpp
@@ -23,6 +23,11 @@ add_test(NAME nmi_evidence COMMAND bubble-evidence-tests)
 add_executable(bubble-ioctl-tests tests/ioctl_tests.cpp)
 target_link_libraries(bubble-ioctl-tests PRIVATE bubble_core)
 add_test(NAME ioctl_observer COMMAND bubble-ioctl-tests)
+add_executable(bubble-runtime-profile-tests tests/runtime_profile_tests.cpp tests/runtime_profile_c.c)
+set_target_properties(bubble-runtime-profile-tests PROPERTIES
+                      C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+target_link_libraries(bubble-runtime-profile-tests PRIVATE bubble_core)
+add_test(NAME ioctl_runtime_profile COMMAND bubble-runtime-profile-tests)
 if(WIN32)
   if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "The analyzer requires an x64 build")

@@ -29,6 +29,8 @@ jobs:
           }
           & build/Release/bubble.exe selftest-ioctl bubble-kernel.exe
           if ($LASTEXITCODE -ne 0) { throw 'Native IOCTL unwind failed' }
+          & build/Release/bubble-runtime-profile-tests.exe bubble-kernel.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime IOCTL profile validation failed' }
       - name: Compile and link the x64 WDM driver
         shell: pwsh
         run: |
