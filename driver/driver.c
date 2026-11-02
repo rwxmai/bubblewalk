@@ -407,9 +407,11 @@ static NTSTATUS NuPulse(NU_PULSE_DATA* Result)
     GROUP_AFFINITY bind = {0}, previous;
     PROCESSOR_NUMBER number;
     ULONG index, sender = MAXULONG, count = 0, attempt;
-    UINT64 now = KeQueryInterruptTime();
+    ULONG64 qpcTimeStamp;
+    UINT64 now;
     if (!gNu.SendNmi || !gNu.InitAffinity || !gNu.AddAffinity) return STATUS_NOT_SUPPORTED;
     if (!InterlockedCompareExchange(&gNu.Armed, 0, 0)) return STATUS_DEVICE_NOT_READY;
+    now = KeQueryInterruptTimePrecise(&qpcTimeStamp);
     if (gNu.PulseGeneration == (ULONG)gNu.Generation ||
         (gNu.LastPulse && now - gNu.LastPulse < NU_PULSE_MIN_MS * 10000ull))
         return STATUS_DEVICE_BUSY;
@@ -436,18 +438,24 @@ static NTSTATUS NuPulse(NU_PULSE_DATA* Result)
         }
     }
     if (!count) return STATUS_NOT_SUPPORTED;
-    gNu.NextSender = (sender + 1) % gNu.CpuCount;
-    gNu.PulseGeneration = (ULONG)gNu.Generation;
-    gNu.LastPulse = now;
-    Result->Generation = (ULONG)gNu.Generation;
-    Result->SenderCpu = sender;
-    Result->TargetCount = count;
     KeSetSystemGroupAffinityThread(&bind, &previous);
     if (!InterlockedCompareExchange(&gNu.Armed, 0, 0)) {
         KeRevertToUserGroupAffinityThread(&previous);
         return STATUS_DEVICE_NOT_READY;
     }
+    now = KeQueryInterruptTimePrecise(&qpcTimeStamp);
+    if (gNu.PulseGeneration == (ULONG)gNu.Generation ||
+        (gNu.LastPulse && now - gNu.LastPulse < NU_PULSE_MIN_MS * 10000ull)) {
+        KeRevertToUserGroupAffinityThread(&previous);
+        return STATUS_DEVICE_BUSY;
+    }
+    gNu.NextSender = (sender + 1) % gNu.CpuCount;
+    gNu.PulseGeneration = (ULONG)gNu.Generation;
+    Result->Generation = (ULONG)gNu.Generation;
+    Result->SenderCpu = sender;
+    Result->TargetCount = count;
     gNu.SendNmi(&targets);
+    gNu.LastPulse = KeQueryInterruptTimePrecise(&qpcTimeStamp);
     KeRevertToUserGroupAffinityThread(&previous);
     return STATUS_SUCCESS;
 }

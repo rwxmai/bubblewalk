@@ -16,17 +16,25 @@ cmake --build build --config Release
 msbuild driver\Bubble.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
 
-Configure the isolated guest with [Configure-Lab.ps1](scripts/Configure-Lab.ps1),
-install the signed `bubble.sys`, and start the Bubble service. From an elevated
-terminal:
+Rebuild both the client and driver to use the 1 ms minimum. Re-sign and install
+the rebuilt `bubble.sys`; an older loaded driver retains its previous rate limit.
+Configure the isolated guest with [Configure-Lab.ps1](scripts/Configure-Lab.ps1)
+and start the Bubble service. From an elevated terminal:
 
 ```powershell
-.\build\Release\bubble.exe monitor --interval-ms 250
+.\build\Release\bubble.exe monitor --interval-ms 1 --duty-percent 1
 ```
 
 Run the driver workload separately. `bubble demo` starts the same monitor.
 Ctrl+C drains the current round and closes the device. `--rounds N` bounds a run;
 `--verbose` includes stack frames and incomplete observations.
+
+The defaults request a 1 ms interval and a 1% round wall-time duty budget. The
+monitor rests after each round according to its measured work, so actual pulse
+spacing can be much longer than 1 ms. This budget does not guarantee 1% CPU use
+or a 1 kHz sampling rate. `monitor_stopped` reports the collector's measured CPU
+time and percentage of one core; it excludes NMI work on other CPUs and does not
+measure the effect on the workload. See [timing and diagnostics](docs/ioctl-monitor.md).
 
 ## Evidence
 

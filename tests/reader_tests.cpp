@@ -62,8 +62,26 @@ int main(int argc, char** argv) {
         require(!nu::interruptedContext(sample,kernel,recovered,error),"Ki return mismatch rejected");
         sample=valid; sample.NmiBytes[sample.Nmi.Size-40-0x2b0]^=1;
         require(!nu::interruptedContext(sample,kernel,recovered,error),"Kx return mismatch rejected");
-        sample=valid; sample.Flags|=NU_F_NMI_TRUNCATED;
-        require(!nu::interruptedContext(sample,kernel,recovered,error),"truncated NMI rejected");
+        const struct { uint32_t Flags; const char* Error; } captureCases[]={
+            {NU_F_ARCH_INVALID,"ARCH_INVALID"},
+            {NU_F_USER_INTERRUPTED,"USER_INTERRUPTED"},
+            {NU_F_STACK_UNSUPPORTED,"STACK_UNSUPPORTED"},
+            {NU_F_NMI_TRUNCATED,"NMI_TRUNCATED"},
+            {NU_F_ARCH_INVALID | NU_F_USER_INTERRUPTED | NU_F_STACK_UNSUPPORTED |
+                NU_F_NMI_TRUNCATED,"ARCH_INVALID"},
+            {NU_F_USER_INTERRUPTED | NU_F_STACK_UNSUPPORTED | NU_F_NMI_TRUNCATED,
+                "USER_INTERRUPTED"},
+            {NU_F_STACK_UNSUPPORTED | NU_F_NMI_TRUNCATED,"STACK_UNSUPPORTED"}
+        };
+        for (const auto& test:captureCases) {
+            sample=valid; sample.Flags|=test.Flags;
+            require(!nu::interruptedContext(sample,kernel,recovered,error),"capture flags rejected");
+            require(error==test.Error,"specific capture flag reason and deterministic priority");
+        }
+        sample=valid; sample.Flags|=NU_F_THREAD_TRUNCATED;
+        require(nu::interruptedContext(sample,kernel,recovered,error),"thread truncation retains interrupted context");
+        require(error.empty() && !std::memcmp(&expected,&recovered,sizeof(expected)),
+            "thread truncation recovers all registers and clears the rejection reason");
         sample=valid; sample.Nmi.Size=40;
         require(!nu::interruptedContext(sample,kernel,recovered,error),"missing register saves rejected");
         sample=valid; sample.KernelBase+=0x1000;

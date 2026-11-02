@@ -30,8 +30,10 @@ bool interruptedContext(const NU_SAMPLE& s, const NU_MODULE& kernel,
         kernel.Base < 0xffff800000000000ull ||
         kernel.Base > std::numeric_limits<uint64_t>::max() - NU_TARGET_SIZE)
         return reject("TARGET_IDENTITY");
-    if (s.Flags & (NU_F_ARCH_INVALID | NU_F_USER_INTERRUPTED | NU_F_STACK_UNSUPPORTED |
-                   NU_F_NMI_TRUNCATED)) return reject("CAPTURE_FLAGS");
+    if (s.Flags & NU_F_ARCH_INVALID) return reject("ARCH_INVALID");
+    if (s.Flags & NU_F_USER_INTERRUPTED) return reject("USER_INTERRUPTED");
+    if (s.Flags & NU_F_STACK_UNSUPPORTED) return reject("STACK_UNSUPPORTED");
+    if (s.Flags & NU_F_NMI_TRUNCATED) return reject("NMI_TRUNCATED");
     if (s.Nmi.Base < 0xffff800000000000ull ||
         s.Nmi.Size < 0x2d8 || s.Nmi.Size > NU_NMI_BYTES ||
         s.Stack.Size > NU_THREAD_BYTES || s.Entry.Rsp != s.Nmi.Base ||

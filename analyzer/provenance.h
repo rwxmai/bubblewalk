@@ -31,6 +31,7 @@ struct StackEvidence {
     bool ContextRecovered=false, InventoryStable=false, StackTruncated=false;
     std::string Stop="context_unavailable";
     std::vector<Frame> Frames;
+    uint32_t CaptureFlags=0;
 };
 struct Finding { std::string Code; Frame Location; };
 struct Evaluation {

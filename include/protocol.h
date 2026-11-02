@@ -17,7 +17,7 @@
 #define NU_DISARM NU_CTL(0x804u)
 #define NU_PULSE NU_CTL(0x807u)
 #define NU_CAP_PULSE 1u
-#define NU_PULSE_MIN_MS 50u
+#define NU_PULSE_MIN_MS 1u
 #define NU_F_ARCH_INVALID      0x0001u
 #define NU_F_USER_INTERRUPTED  0x0002u
 #define NU_F_STACK_UNSUPPORTED 0x0004u

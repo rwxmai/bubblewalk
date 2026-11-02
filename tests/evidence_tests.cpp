@@ -30,6 +30,18 @@ int main() {
         check(r.Findings[0].Code=="NMI_RIP_OUTSIDE_EXECUTABLE_SECTIONS","RIP section evidence");
         auto json=nu::reportJson(e,r);
         check(json.find("\\\"")!=std::string::npos&&json.find("\\\\")!=std::string::npos&&json.find("\\u000a")!=std::string::npos,"JSON path escaping");
+        check(json.find("\"capture_flags\":0,")!=std::string::npos,"default capture flags remain zero");
+        nu::StackEvidence rejected{0,1,0xabcdef,false,true,false,"context_CAPTURE_FLAGS",{}};
+        rejected.CaptureFlags=NU_F_ARCH_INVALID|NU_F_STACK_UNSUPPORTED|NU_F_NMI_TRUNCATED;
+        const auto rejectedResult=nu::evaluate(rejected);
+        const auto rejectedJson=nu::reportJson(rejected,rejectedResult);
+        check(rejectedResult.Status=="incomplete"&&!rejectedResult.Complete&&rejectedResult.Findings.empty(),
+              "raw capture flags do not bypass rejected context");
+        check(rejectedJson.find("\"capture_flags\":13,")!=std::string::npos&&
+              rejectedJson.find("\"frame_count\":0,")!=std::string::npos&&
+              rejectedJson.find("\"context_recovered\":false,")!=std::string::npos&&
+              rejectedJson.find("\"stop\":\"context_CAPTURE_FLAGS\"")!=std::string::npos,
+              "rejected empty context preserves raw capture mask as decimal JSON");
         e.Frames={map.classify(base+0x1010,sp,0),map.classify(base+0x2010,sp+40,1)};
         check(nu::evaluate(e).Findings[0].Code=="NMI_CALLER_OUTSIDE_EXECUTABLE_SECTIONS","caller section evidence");
         e.Frames={map.classify(base+0x1010,sp,0)};e.Stop="terminal";

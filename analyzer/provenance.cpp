@@ -91,6 +91,7 @@ std::string reportJson(const StackEvidence& e,const Evaluation& r) {
        <<",\"context_recovered\":"<<(e.ContextRecovered?"true":"false")
        <<",\"inventory_stable\":"<<(e.InventoryStable?"true":"false")
        <<",\"stack_truncated\":"<<(e.StackTruncated?"true":"false")
+       <<",\"capture_flags\":"<<std::dec<<e.CaptureFlags
        <<",\"frame_count\":"<<e.Frames.size()<<",\"findings\":[";
     bool first=true;
     for(const auto& f:r.Findings) {

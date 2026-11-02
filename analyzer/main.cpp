@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include <windows.h>
+#include <realtimeapiset.h>
 #include <winioctl.h>
 #include <dbghelp.h>
 #include "../include/protocol.h"
@@ -7,6 +8,7 @@
 #include "interrupted_context.h"
 #include "provenance.h"
 #include "ioctl_observer.h"
+#include "monitor_timing.h"
 #include "../include/ioctl_26100_1.h"
 #include <random>
 #include "demo.h"
@@ -49,6 +51,7 @@ struct Image {
     fs::path File;
     std::unique_ptr<nu::PeImage> Pe;
     std::string Error;
+    bool KernelProfile=false;
 };
 struct Walker {
     const NU_SAMPLE* Sample = nullptr;
@@ -68,19 +71,61 @@ Walker* active = nullptr;
 void failWin(const char* message) {
     throw std::runtime_error(std::string(message) + ": Win32=" + std::to_string(GetLastError()));
 }
-bool ioctl(HANDLE h, DWORD code, void* in, DWORD ins, void* out, DWORD outs, DWORD& count) {
-    Handle event;
-    event.value=CreateEventW(nullptr,TRUE,FALSE,nullptr);
-    if(!event.value){event.value=INVALID_HANDLE_VALUE;return false;}
-    OVERLAPPED pending{};pending.hEvent=event.value;
+uint64_t preciseTime() {
+    ULONGLONG value=0;
+    QueryInterruptTimePrecise(&value);
+    return value;
+}
+uint64_t processCpuTime() {
+    FILETIME created{},exited{},kernel{},user{};
+    if(!GetProcessTimes(GetCurrentProcess(),&created,&exited,&kernel,&user))failWin("process CPU time");
+    const auto ticks=[](const FILETIME& value) {
+        return (uint64_t(value.dwHighDateTime)<<32)|value.dwLowDateTime;
+    };
+    return ticks(kernel)+ticks(user);
+}
+class MonitorWait {
+    Handle timer;
+    HANDLE stop;
+public:
+    explicit MonitorWait(HANDLE stopEvent):stop(stopEvent) {
+        timer.value=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                         TIMER_MODIFY_STATE|SYNCHRONIZE);
+        if(!timer.value){timer.value=INVALID_HANDLE_VALUE;failWin("create high-resolution timer");}
+    }
+    bool wait(uint64_t duration100ns) {
+        if(!duration100ns)return WaitForSingleObject(stop,0)==WAIT_TIMEOUT;
+        LARGE_INTEGER due{};
+        due.QuadPart=-static_cast<LONGLONG>(std::min(duration100ns,uint64_t(INT64_MAX)));
+        if(!SetWaitableTimer(timer.value,&due,0,nullptr,nullptr,FALSE))failWin("set monitor timer");
+        const HANDLE events[]={stop,timer.value};
+        const auto result=WaitForMultipleObjects(2,events,FALSE,INFINITE);
+        if(result==WAIT_OBJECT_0)return false;
+        if(result==WAIT_OBJECT_0+1)return true;
+        if(result==WAIT_FAILED)failWin("wait monitor timer");
+        throw std::runtime_error("unexpected monitor timer result");
+    }
+};
+bool ioctl(HANDLE h, DWORD code, void* in, DWORD ins, void* out, DWORD outs, DWORD& count,
+           HANDLE completionEvent=nullptr) {
+    Handle ownedEvent;
+    if(!completionEvent) {
+        ownedEvent.value=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+        if(!ownedEvent.value){ownedEvent.value=INVALID_HANDLE_VALUE;return false;}
+        completionEvent=ownedEvent.value;
+    } else if(!ResetEvent(completionEvent))return false;
+    OVERLAPPED pending{};pending.hEvent=completionEvent;
     const BOOL done=DeviceIoControl(h,code,in,ins,out,outs,&count,&pending);
     if(!done&&GetLastError()!=ERROR_IO_PENDING)return false;
     return GetOverlappedResult(h,&pending,&count,TRUE)!=FALSE;
 }
-std::vector<NU_MODULE> modules(HANDLE h) {
-    std::vector<uint8_t> buffer(4 * 1024 * 1024);
+std::vector<NU_MODULE> modules(HANDLE h,HANDLE completionEvent=nullptr,
+                               std::vector<uint8_t>* scratch=nullptr) {
+    std::vector<uint8_t> local;
+    auto& buffer=scratch?*scratch:local;
+    buffer.resize(4 * 1024 * 1024);
     DWORD count = 0;
-    if (!ioctl(h, NU_MODULES, nullptr, 0, buffer.data(), DWORD(buffer.size()), count))
+    if (!ioctl(h, NU_MODULES, nullptr, 0, buffer.data(), DWORD(buffer.size()), count,completionEvent))
         failWin("module inventory");
     if (count < sizeof(NU_MODULE_HEADER)) throw std::runtime_error("short module response");
     NU_MODULE_HEADER header{};
@@ -495,6 +540,7 @@ void analyze(const fs::path& path,const Capture& c) {
             if(!nu::interruptedContext(sample,kernel->Module,interrupted,error))w.Evidence.Stop="context_"+error;
             else walk(w,sample,interrupted,c.Header.InventoryStable!=0);
         }
+        w.Evidence.CaptureFlags=sample.Flags;
         const auto result=nu::evaluate(w.Evidence);
         std::cout<<nu::reportJson(w.Evidence,result)<<"\n";
         const auto observation=nu::observeIoctl(sample,w.Evidence,
@@ -584,13 +630,14 @@ void refreshImages(Walker& w,const std::vector<NU_MODULE>& inventory) {
             image.File=sourcePath(module);
             image.Pe=std::make_unique<nu::PeImage>(nu::PeImage::load(image.File));
             checkIdentity(module,*image.Pe);
+            image.KernelProfile=nu::targetImage(*image.Pe)&&nu::ioctlTarget(*image.Pe);
         } catch(const std::exception& e) {image.Pe.reset();image.Error=e.what();}
         next.push_back(std::move(image));
     }
     w.Images=std::move(next);
 }
 
-void monitor(uint32_t interval,uint32_t rounds,bool verbose) {
+void monitor(uint32_t interval,uint32_t rounds,bool verbose,uint32_t dutyPercent) {
     Handle stop;
     stop.value=CreateEventW(nullptr,TRUE,FALSE,nullptr);
     if(!stop.value){stop.value=INVALID_HANDLE_VALUE;failWin("stop event");}
@@ -601,8 +648,12 @@ void monitor(uint32_t interval,uint32_t rounds,bool verbose) {
     device.value=CreateFileW(NU_DEVICE_PATH,GENERIC_READ|GENERIC_WRITE,0,nullptr,
                              OPEN_EXISTING,FILE_FLAG_OVERLAPPED,nullptr);
     if(device.value==INVALID_HANDLE_VALUE)failWin("open Bubble (administrator required)");
+    Handle completion;
+    completion.value=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    if(!completion.value){completion.value=INVALID_HANDLE_VALUE;failWin("create monitor IOCTL event");}
+    MonitorWait pause(stop.value);
     DWORD count=0;NU_INFO_DATA info{};
-    if(!ioctl(device.value,NU_INFO,nullptr,0,&info,sizeof(info),count))failWin("info");
+    if(!ioctl(device.value,NU_INFO,nullptr,0,&info,sizeof(info),count,completion.value))failWin("info");
     if(count!=sizeof(info)||info.Version!=NU_VERSION||info.SampleSize!=sizeof(NU_SAMPLE)||
        info.Build!=NU_TARGET_BUILD||!info.CpuCount||info.CpuCount>4096)
         throw std::runtime_error("driver/client profile mismatch");
@@ -614,37 +665,63 @@ void monitor(uint32_t interval,uint32_t rounds,bool verbose) {
     struct Symbols {HANDLE p;~Symbols(){active=nullptr;SymCleanup(p);}} symbols{process};
     if(!SymRegisterCallback64(process,symbolCallback,0))failWin("SymRegisterCallback64");
     Walker walker;walker.Verbose=verbose;
-    uint64_t round=0,total=0,observations=0;
+    uint64_t round=0,total=0,observations=0,previousPulse=0;
     std::mt19937 jitter(std::random_device{}());
     std::uniform_int_distribution<uint32_t> extra(0,interval/4);
+    std::vector<uint8_t> moduleBuffer(4 * 1024 * 1024);
+    std::vector<NU_MODULE> imageInventory;
+    std::vector<NU_SAMPLE> samples;
+    samples.reserve(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    std::vector<bool> seen(info.CpuCount,false);
+    auto sample=std::make_unique<NU_SAMPLE>();
+    const auto monitoringStarted=preciseTime();
+    const auto cpuStarted=processCpuTime();
     std::cerr<<"MONITOR: periodic NMI capture; Ctrl+C stops. Run the driver workload separately.\n";
     std::cout<<"{\"event\":\"monitor_started\",\"interval_ms\":"<<interval
-             <<",\"jitter_max_ms\":"<<interval/4<<",\"coverage\":\"sampled\"}\n"<<std::flush;
+             <<",\"jitter_max_ms\":"<<interval/4<<",\"duty_percent\":"<<dutyPercent
+             <<",\"min_interval_ms\":"<<NU_PULSE_MIN_MS<<",\"coverage\":\"sampled\"}\n"<<std::flush;
     while(WaitForSingleObject(stop.value,0)==WAIT_TIMEOUT&&(!rounds||round<rounds)) {
-        const auto started=GetTickCount64();
-        auto before=modules(device.value);
-        refreshImages(walker,before);
+        const auto started=preciseTime();
+        auto before=modules(device.value,completion.value,&moduleBuffer);
+        if(!sameModules(before,imageInventory)) {
+            refreshImages(walker,before);
+            imageInventory=before;
+        }
         bool kernelReady=false;
         for(const auto& image:walker.Images)
-            if(image.Pe&&nu::targetImage(*image.Pe)&&nu::ioctlTarget(*image.Pe))kernelReady=true;
+            if(image.KernelProfile)kernelReady=true;
         if(!kernelReady)throw std::runtime_error("matching kernel PE and IOCTL profile unavailable");
-        if(!ioctl(device.value,NU_ARM,nullptr,0,nullptr,0,count))failWin("arm");
+        if(!ioctl(device.value,NU_ARM,nullptr,0,nullptr,0,count,completion.value))failWin("arm");
         struct RoundCleanup {
-            HANDLE h;bool Armed=true;
-            ~RoundCleanup(){if(Armed){DWORD n=0;ioctl(h,NU_DISARM,nullptr,0,nullptr,0,n);}}
-        } cleanup{device.value};
+            HANDLE h,completion;bool Armed=true;
+            ~RoundCleanup(){if(Armed){DWORD n=0;ioctl(h,NU_DISARM,nullptr,0,nullptr,0,n,completion);}}
+        } cleanup{device.value,completion.value};
         NU_PULSE_DATA pulse{};
-        if(!ioctl(device.value,NU_PULSE,nullptr,0,&pulse,sizeof(pulse),count))failWin("send NMI");
+        const auto attempted=preciseTime();
+        uint32_t rateRetries=0;
+        bool cancelled=false;
+        for(;;) {
+            if(ioctl(device.value,NU_PULSE,nullptr,0,&pulse,sizeof(pulse),count,completion.value))break;
+            const auto error=GetLastError();
+            if(error!=ERROR_BUSY||preciseTime()-attempted>=2500000ull) {
+                SetLastError(error);failWin("send NMI");
+            }
+            ++rateRetries;
+            if(!pause.wait(10000)){cancelled=true;break;}
+        }
+        if(cancelled)break;
         if(count!=sizeof(pulse)||!pulse.TargetCount||pulse.TargetCount>=info.CpuCount||
            pulse.SenderCpu>=info.CpuCount)throw std::runtime_error("invalid pulse response");
-        std::vector<NU_SAMPLE> samples;
-        std::vector<bool> seen(info.CpuCount,false);
-        auto sample=std::make_unique<NU_SAMPLE>();
+        const auto sent=preciseTime();
+        const auto pulseInterval=previousPulse?sent-previousPulse:0;
+        previousPulse=sent;
+        samples.clear();
+        std::fill(seen.begin(),seen.end(),false);
         uint32_t received=0;
         auto drain=[&] {
             for(uint32_t cpu=0;cpu<info.CpuCount;++cpu) {
                 if(seen[cpu])continue;
-                if(!ioctl(device.value,NU_READ,&cpu,sizeof(cpu),sample.get(),sizeof(*sample),count)) {
+                if(!ioctl(device.value,NU_READ,&cpu,sizeof(cpu),sample.get(),sizeof(*sample),count,completion.value)) {
                     const auto error=GetLastError();
                     if(error==ERROR_NO_MORE_ITEMS||error==ERROR_NO_MORE_FILES)continue;
                     failWin("read sample");
@@ -656,23 +733,22 @@ void monitor(uint32_t interval,uint32_t rounds,bool verbose) {
                 if(cpu!=pulse.SenderCpu)++received;
             }
         };
-        const auto sent=GetTickCount64();
         do {
             drain();
-            if(received>=pulse.TargetCount||GetTickCount64()-sent>=100)break;
-            if(WaitForSingleObject(stop.value,1)!=WAIT_TIMEOUT)break;
+            if(received>=pulse.TargetCount||preciseTime()-sent>=1000000ull)break;
+            if(!pause.wait(10000))break;
         } while(true);
-        if(!ioctl(device.value,NU_DISARM,nullptr,0,nullptr,0,count))failWin("disarm");
+        if(!ioctl(device.value,NU_DISARM,nullptr,0,nullptr,0,count,completion.value))failWin("disarm");
         cleanup.Armed=false;
         drain();
-        const bool stable=sameModules(before,modules(device.value));
-        uint32_t ioctlCount=0,incomplete=0;
+        const bool stable=sameModules(before,modules(device.value,completion.value,&moduleBuffer));
+        uint32_t ioctlCount=0,incomplete=0,recovered=0;
         active=&walker;
         for(const auto& item:samples) {
             walker.Evidence={item.Cpu,item.Generation,item.Tsc,false,stable,
                 (item.Flags&NU_F_THREAD_TRUNCATED)!=0,"context_unavailable",{}};
             auto kernel=walker.find(item.KernelBase);
-            const bool target=kernel&&kernel->Pe&&nu::targetImage(*kernel->Pe)&&nu::ioctlTarget(*kernel->Pe);
+            const bool target=kernel&&kernel->KernelProfile;
             if(item.Flags&NU_F_USER_INTERRUPTED)walker.Evidence.Stop="user_context";
             else if(!target)walker.Evidence.Stop="target_mismatch";
             else {
@@ -680,6 +756,8 @@ void monitor(uint32_t interval,uint32_t rounds,bool verbose) {
                 if(!nu::interruptedContext(item,kernel->Module,interrupted,error))walker.Evidence.Stop="context_"+error;
                 else walk(walker,item,interrupted,stable);
             }
+            walker.Evidence.CaptureFlags=item.Flags;
+            if(walker.Evidence.ContextRecovered)++recovered;
             const auto observation=nu::observeIoctl(item,walker.Evidence,target);
             if(observation.Observed){++ioctlCount;std::cout<<nu::ioctlJson(item,observation)<<"\n";}
             const auto result=nu::evaluate(walker.Evidence);
@@ -691,16 +769,35 @@ void monitor(uint32_t interval,uint32_t rounds,bool verbose) {
         std::cout<<"{\"event\":\"nmi_round\",\"round\":"<<round<<",\"generation\":"<<pulse.Generation
                  <<",\"sender_cpu\":"<<pulse.SenderCpu<<",\"targeted\":"<<pulse.TargetCount
                  <<",\"captured\":"<<received<<",\"ioctl_observations\":"<<ioctlCount
+                 <<",\"context_recovered_samples\":"<<recovered
                  <<",\"incomplete_samples\":"<<incomplete<<",\"inventory_stable\":"<<(stable?"true":"false")
-                 <<",\"elapsed_ms\":"<<GetTickCount64()-started<<"}\n"<<std::flush;
+                 <<",\"pulse_interval_ms\":"<<(round>1?std::to_string(pulseInterval/10000.0):"null")
+                 <<",\"rate_limit_retries\":"<<rateRetries
+                 <<",\"elapsed_ms\":"<<(preciseTime()-started)/10000.0<<"}\n"<<std::flush;
         if(received<pulse.TargetCount&&WaitForSingleObject(stop.value,0)==WAIT_TIMEOUT)
             throw std::runtime_error("NMI delivery incomplete; stopping before another generation");
-        const auto elapsed=GetTickCount64()-started;
-        const uint64_t delay=interval+extra(jitter);
-        if(elapsed<delay)WaitForSingleObject(stop.value,DWORD(delay-elapsed));
+        if(rounds&&round>=rounds)break;
+        /* monitor: Include inventory, capture, decode and flushed output in
+         * measured wall work. Rest to meet the requested duty budget as well
+         * as the minimum send interval; never spin or catch up with bursts.
+         */
+        const auto workFinished=preciseTime();
+        const auto dutyRest=nu::monitorDutyDelay100ns(workFinished-started,dutyPercent);
+        const auto jitterMs=extra(jitter);
+        for(;;) {
+            const auto now=preciseTime();
+            const auto idle=now-workFinished;
+            const auto remainingDuty=idle<dutyRest?dutyRest-idle:0;
+            const auto delay=std::max(remainingDuty,nu::monitorDelay100ns(sent,now,interval,jitterMs));
+            if(!delay||!pause.wait(delay))break;
+        }
     }
+    const auto cpuTime=processCpuTime()-cpuStarted;
+    const auto monitoredTime=preciseTime()-monitoringStarted;
     std::cout<<"{\"event\":\"monitor_stopped\",\"rounds\":"<<round<<",\"samples\":"<<total
-             <<",\"ioctl_observations\":"<<observations<<"}\n"<<std::flush;
+             <<",\"ioctl_observations\":"<<observations<<",\"collector_cpu_ms\":"<<cpuTime/10000.0
+             <<",\"collector_cpu_percent_of_one_core\":"<<(monitoredTime?100.0*cpuTime/monitoredTime:0.0)
+             <<"}\n"<<std::flush;
 }
 
 }
@@ -711,24 +808,27 @@ int wmain(int argc,wchar_t** argv) {
         if(argc==2&&std::wstring(argv[1])==L"selftest"){selftest();return 0;}
         if(argc==3&&std::wstring(argv[1])==L"selftest-ioctl"){ioctlSelftest(argv[2]);return 0;}
         if(argc>=2&&(std::wstring(argv[1])==L"monitor"||std::wstring(argv[1])==L"demo")) {
-            uint32_t interval=250,rounds=0;bool verbose=false;
+            uint32_t interval=NU_PULSE_MIN_MS,rounds=0,dutyPercent=1;bool verbose=false;
             for(int i=2;i<argc;++i) {
                 const std::wstring option=argv[i];
                 if(option==L"--verbose"){verbose=true;continue;}
-                if((option!=L"--interval-ms"&&option!=L"--rounds")||i+1>=argc)
-                    throw std::runtime_error("expected --interval-ms N, --rounds N or --verbose");
+                if((option!=L"--interval-ms"&&option!=L"--rounds"&&option!=L"--duty-percent")||i+1>=argc)
+                    throw std::runtime_error("expected --interval-ms N, --rounds N, --duty-percent N or --verbose");
                 const std::wstring value=argv[++i];
                 if(value.empty()||value.find_first_not_of(L"0123456789")!=std::wstring::npos)
                     throw std::runtime_error("expected an unsigned decimal integer");
                 const auto number=std::stoull(value);
                 if(number>UINT32_MAX)throw std::runtime_error("option exceeds uint32");
-                if(option==L"--interval-ms")interval=uint32_t(number);else rounds=uint32_t(number);
+                if(option==L"--interval-ms")interval=uint32_t(number);
+                else if(option==L"--duty-percent")dutyPercent=uint32_t(number);
+                else rounds=uint32_t(number);
             }
-            if(interval<NU_PULSE_MIN_MS||interval>60000)throw std::runtime_error("interval must be 50..60000 ms");
-            monitor(interval,rounds,verbose);return 0;
+            if(interval<NU_PULSE_MIN_MS||interval>60000)throw std::runtime_error("interval must be 1..60000 ms");
+            if(!dutyPercent||dutyPercent>100)throw std::runtime_error("duty percent must be 1..100");
+            monitor(interval,rounds,verbose,dutyPercent);return 0;
         }
         if(argc<3||argc>4) {
-            std::cerr<<"Usage: bubble monitor [--interval-ms N] [--rounds N] [--verbose]\n"
+            std::cerr<<"Usage: bubble monitor [--interval-ms N] [--rounds N] [--duty-percent N] [--verbose]\n"
                        "       bubble demo (live monitor)\n"
                        "       bubble capture|analyze bubble.nwu\n"
                        "       bubble replay | bubble selftest\n";return 1;
