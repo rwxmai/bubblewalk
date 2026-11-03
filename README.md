@@ -6,6 +6,9 @@ observations. No driver list, file reputation or IOCTL semantics participate.
 
 tested in Win 11 24H2 (ntoskrnl 10.0.26100.1)
 
+The [NMI demo drivers](nmi-demo-drivers/README.md) provide separate lab workloads
+for unowned execution and IOCTL observation.
+
 ## Run
 
 Build with Visual Studio x64, Windows 11 SDK/WDK and CMake 3.20+:
