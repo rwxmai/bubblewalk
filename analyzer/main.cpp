@@ -7,7 +7,9 @@
 #include "pe_image.h"
 #include "interrupted_context.h"
 #include "provenance.h"
+#include "provenance_alert.h"
 #include "ioctl_observer.h"
+#include "ioctl_alert.h"
 #include "monitor_timing.h"
 #include "../include/ioctl_26100_1.h"
 #include <random>
@@ -355,7 +357,9 @@ WalkResult walk(Walker& w, const NU_SAMPLE& sample, const NU_REGS& interrupted, 
         auto observed=map.classify(pc,sp,depth);
         if(observed.Kind==nu::FrameKind::Invalid)return finish(WalkResult::Incomplete,"invalid_frame");
         w.Evidence.Frames.push_back(observed);
-        if(w.Verbose)std::cout<<"  "<<depth<<" pc=0x"<<std::hex<<pc<<" sp=0x"<<sp<<std::dec<<" "<<observed.Image<<"\n";
+        if(w.Verbose)std::clog<<"frame cpu="<<sample.Cpu<<" generation="<<sample.Generation
+                              <<" depth="<<depth<<" pc=0x"<<std::hex<<pc<<" sp=0x"<<sp
+                              <<std::dec<<" image="<<observed.Image<<"\n";
         if(observed.Kind==nu::FrameKind::OutsideModules)return finish(WalkResult::OutsideModules,"outside_modules");
         if(observed.Kind==nu::FrameKind::MissingImage)return finish(WalkResult::Incomplete,"missing_image");
         if(observed.Kind==nu::FrameKind::NonExecutableImage)return finish(WalkResult::NonExecutable,"nonexecutable_image");
@@ -508,6 +512,21 @@ void selftest() {
     std::cout << "SELFTEST_PASSED: caller attribution, read probes, terminal state, no progress, and truncation.\n";
 }
 
+void emitIoctl(const NU_SAMPLE& sample,const nu::IoctlObservation& observation) {
+    std::cout<<nu::ioctlJson(sample,observation)<<"\n"<<std::flush;
+    std::cerr<<nu::ioctlAlertText(sample,observation)<<std::flush;
+}
+
+void emitIoctlRejection(const NU_SAMPLE& sample,const nu::StackEvidence& evidence,
+                        const nu::IoctlDiagnosis& diagnosis) {
+    if(!diagnosis.Candidate||!diagnosis.Rejection)return;
+    std::clog<<"ioctl_candidate_rejected cpu="<<sample.Cpu
+             <<" generation="<<sample.Generation
+             <<" nt_depth="<<diagnosis.CandidateDepth
+             <<" reason="<<diagnosis.Rejection
+             <<" walk_stop="<<evidence.Stop<<'\n';
+}
+
 void analyze(const fs::path& path,const Capture& c) {
     Walker w;
     HANDLE process=GetCurrentProcess();
@@ -543,9 +562,11 @@ void analyze(const fs::path& path,const Capture& c) {
         w.Evidence.CaptureFlags=sample.Flags;
         const auto result=nu::evaluate(w.Evidence);
         std::cout<<nu::reportJson(w.Evidence,result)<<"\n";
-        const auto observation=nu::observeIoctl(sample,w.Evidence,
+        if(!result.Findings.empty())std::cerr<<nu::provenanceAlerts(w.Evidence,result)<<std::flush;
+        const auto diagnosis=nu::diagnoseIoctl(sample,w.Evidence,
             kernel&&kernel->Pe&&nu::ioctlTarget(*kernel->Pe));
-        if(observation.Observed)std::cout<<nu::ioctlJson(sample,observation)<<"\n";
+        if(diagnosis.Observation.Observed)emitIoctl(sample,diagnosis.Observation);
+        else emitIoctlRejection(sample,w.Evidence,diagnosis);
     }
     active=nullptr;
 }
@@ -758,11 +779,14 @@ void monitor(uint32_t interval,uint32_t rounds,bool verbose,uint32_t dutyPercent
             }
             walker.Evidence.CaptureFlags=item.Flags;
             if(walker.Evidence.ContextRecovered)++recovered;
-            const auto observation=nu::observeIoctl(item,walker.Evidence,target);
-            if(observation.Observed){++ioctlCount;std::cout<<nu::ioctlJson(item,observation)<<"\n";}
+            const auto diagnosis=nu::diagnoseIoctl(item,walker.Evidence,target);
+            if(diagnosis.Observation.Observed){++ioctlCount;emitIoctl(item,diagnosis.Observation);}
+            else if(verbose)emitIoctlRejection(item,walker.Evidence,diagnosis);
             const auto result=nu::evaluate(walker.Evidence);
             if(result.Status=="incomplete")++incomplete;
             if(verbose||!result.Findings.empty())std::cout<<nu::reportJson(walker.Evidence,result)<<"\n";
+            if(!result.Findings.empty())
+                std::cerr<<nu::provenanceAlerts(walker.Evidence,result)<<std::flush;
         }
         active=nullptr;
         ++round;total+=samples.size();observations+=ioctlCount;
