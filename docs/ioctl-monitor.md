@@ -48,6 +48,14 @@ boundary. A framework dispatcher can therefore name the framework's image;
 this field does not claim to identify its client driver or every lower filter.
 The code describes the original submission, not a modified downstream request.
 
+## Alerts
+
+Every validated `nmi_ioctl` prints `IOCTL Detected (sampled)` on stderr with its
+dispatch image, code, sizes, PC, thread, CPU, generation and path. JSONL stays
+on stdout. The image owns the sampled dispatch frame and may be a framework.
+The alert does not prove malice or signing status; one request can yield several
+samples. Unowned-code findings get separate alerts without IOCTL attribution.
+
 ## Round lifecycle
 
 1. Query the module inventory and cache matching PE metadata and kernel-profile validation.
@@ -115,9 +123,12 @@ observations means no supported dispatch was observed in those samples.
 
 ## Diagnose rejected captures
 
-Use `bubble monitor --interval-ms 1 --duty-percent 1 --rounds 20 --verbose` to include
-`nmi_stack` reports. They include the raw decimal `capture_flags` bitmask and
-specific context rejection reasons:
+Run `bubble monitor --verbose` to get `nmi_stack` JSONL on stdout and frames on
+stderr. A walk that reaches the pinned `NtDeviceIoControlFile` return site but
+fails validation also prints `ioctl_candidate_rejected` with CPU, generation,
+depth, reason and walk stop. `bubble analyze` prints these lines too. Unrelated
+samples do not print candidate-rejection lines. `nmi_stack.capture_flags` is a
+decimal bitmask; stops include:
 
 | Stop | Meaning |
 | --- | --- |

@@ -32,6 +32,12 @@ Run the driver workload separately. `bubble demo` starts the same monitor.
 Ctrl+C drains the current round and closes the device. `--rounds N` bounds a run;
 `--verbose` includes stack frames and incomplete observations.
 
+When Bubble catches a dispatch, stderr shows `IOCTL Detected (sampled)` with
+the dispatch image, code, sizes, PC, thread, CPU and generation. JSONL stays on
+stdout. One request may appear in several samples; the alert does not establish
+malice or signature status. Unowned-code findings get separate kernel anomaly
+alerts and are not tied to an IOCTL.
+
 The defaults request a 1 ms interval and a 1% round wall-time duty budget. The
 monitor rests after each round according to its measured work, so actual pulse
 spacing can be much longer than 1 ms. This budget does not guarantee 1% CPU use

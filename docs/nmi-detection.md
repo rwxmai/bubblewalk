@@ -13,6 +13,10 @@ The provenance evaluator retains four independent findings:
 | `NMI_RIP_OUTSIDE_EXECUTABLE_SECTIONS` | RIP lacks executable PE section coverage |
 | `NMI_CALLER_OUTSIDE_EXECUTABLE_SECTIONS` | A caller lacks that coverage |
 
+Each finding prints a stderr alert with the PC, image if known, CPU and
+generation. Caller findings describe return addresses, not observed execution.
+These alerts establish neither IOCTL activity nor signing status.
+
 No filename, vulnerable-driver hash or external catalog enters either predicate.
 Module boundaries supply ownership; archived PE sections supply permissions and
 unwind records. They do not attest runtime bytes, PTE permissions or signatures.
