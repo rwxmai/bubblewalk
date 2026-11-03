@@ -113,15 +113,18 @@ and [`sc.exe create`](https://learn.microsoft.com/en-us/windows-server/administr
 
 1. In the already configured `26100.1` guest, check `sc.exe query Bubble`;
    if it is `STOPPED`, run `sc.exe start Bubble`. Then start
-   `bubble.exe monitor --rounds 120 --verbose`
-   before launching either workload. Keep stdout and stderr separately.
-2. Run the existing root `Ioctl-Workload.ps1` against the guest's test disk as
-   a benign read-only IOCTL baseline.
+   `bubble.exe monitor --interval-ms 1` before each workload. Keep stdout
+   (JSONL) and stderr separate; stop with Ctrl+C afterward. Skip `--rounds`:
+   a fixed run can finish before the workload starts.
+2. With `NmiIoctlLab` started as above, run
+   `nmi-ioctl-client.exe --mode status --count 100 --spacing-ms 20` as a
+   read-access IOCTL baseline.
 3. With `NmiIoctlLab` started as above, run
    `nmi-ioctl-client.exe --mode evaluate --count 100 --spacing-ms 20`
-   to send natural short requests. Repeat with `--hold-ms 20` only as a labelled
-   diagnostic timing control. `--read-only` and `--bad-length` are negative
-   controls; see [client usage](ioctl-lab/CLIENT.md).
+   for short requests. If none are sampled, repeat with `--hold-ms 20` and
+   monitor at `--duty-percent 100 --verbose`. This artificial hold tests
+   sensitivity; check actual `pulse_interval_ms`. `--read-only` and
+   `--bad-length` are negative controls; see [client usage](ioctl-lab/CLIENT.md).
 4. On a disposable guest snapshot, manually map `nmi-fixture.sys` using the
    local kdmapper **without `--free`**. Capture mapper allocation-base output,
    the PE `SizeOfImage` (`dumpbin /headers nmi-fixture.sys`), and the worker's
