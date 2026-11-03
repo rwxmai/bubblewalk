@@ -16,12 +16,31 @@ bool ioctlTarget(const PeImage& image) {
     return true;
 }
 
-IoctlObservation observeIoctl(const NU_SAMPLE& sample,const StackEvidence& e,bool validated) {
-    IoctlObservation result;
-    if(!validated||!e.ContextRecovered||!e.InventoryStable||
-       sample.Stack.Size>NU_THREAD_BYTES||sample.KernelBase<0xffff800000000000ull||
-       sample.KernelBase>UINT64_MAX-NU_TARGET_SIZE)return result;
+IoctlDiagnosis diagnoseIoctl(const NU_SAMPLE& sample,const StackEvidence& e,bool validated) {
+    IoctlDiagnosis diagnosis;
+    if(sample.KernelBase<0xffff800000000000ull||
+       sample.KernelBase>UINT64_MAX-NU_TARGET_SIZE)return diagnosis;
     const auto& frames=e.Frames;
+    for(size_t i=0;i<frames.size();++i) {
+        if(frames[i].Pc==sample.KernelBase+NU_IOCTL_NT_RETURN) {
+            diagnosis.Candidate=true;
+            diagnosis.CandidateDepth=uint32_t(i);
+            break;
+        }
+    }
+    /* An isolated IofCallDriver frame is shared by other IRP types. Only the
+     * distinct Nt return site justifies an IOCTL-specific rejection report.
+     */
+    if(!diagnosis.Candidate)return diagnosis;
+    if(!validated) {diagnosis.Rejection="target_profile";return diagnosis;}
+    if(!e.ContextRecovered) {diagnosis.Rejection="context_unavailable";return diagnosis;}
+    if(!e.InventoryStable) {diagnosis.Rejection="inventory_unstable";return diagnosis;}
+    if(sample.Stack.Size>NU_THREAD_BYTES) {
+        diagnosis.Rejection="sample_bounds";return diagnosis;
+    }
+    auto reject=[&](const char* reason) {
+        if(!diagnosis.Rejection)diagnosis.Rejection=reason;
+    };
     size_t valid=0;
     for(size_t i=0;i<frames.size();++i) {
         const auto& f=frames[i];
@@ -33,8 +52,10 @@ IoctlObservation observeIoctl(const NU_SAMPLE& sample,const StackEvidence& e,boo
     auto at=[&](size_t i,uint64_t rva) {
         return i<frames.size()&&frames[i].Pc==sample.KernelBase+rva;
     };
-    for(size_t nt=2;nt<valid;++nt) {
+    for(size_t nt=0;nt<frames.size();++nt) {
         if(!at(nt,NU_IOCTL_NT_RETURN))continue;
+        if(nt>=valid) {reject("invalid_frame_prefix");break;}
+        if(nt<2) {reject("missing_dispatch_frame");continue;}
         size_t dispatch=0;
         const char* path=nullptr;
         /* ioctl: Require adjacent return sites through the first dispatch
@@ -45,13 +66,17 @@ IoctlObservation observeIoctl(const NU_SAMPLE& sample,const StackEvidence& e,boo
            at(nt-3,NU_IOCTL_DRIVER_RETURN)) {
             dispatch=nt-4;path="irp_dispatch";
             if(frames[nt-2].Sp-frames[nt-3].Sp!=0x40||
-               frames[nt-1].Sp-frames[nt-2].Sp!=0xb0)continue;
+               frames[nt-1].Sp-frames[nt-2].Sp!=0xb0) {
+                reject("frame_extent_mismatch");continue;
+            }
         } else if(at(nt-1,NU_IOCTL_FAST_RETURN)) {
             dispatch=nt-2;path="fast_io_dispatch";
-        } else continue;
-        if(frames[nt].Sp-frames[nt-1].Sp!=0x270)continue;
+        } else {reject("return_chain_mismatch");continue;}
+        if(frames[nt].Sp-frames[nt-1].Sp!=0x270) {
+            reject("frame_extent_mismatch");continue;
+        }
         const auto sp=frames[nt].Sp;
-        if(sp>UINT64_MAX-0xbc)continue;
+        if(sp>UINT64_MAX-0xbc) {reject("argument_unavailable");continue;}
         auto read=[&](uint64_t offset,void* to,size_t size) {
             return readRegion(sample.Stack.Base,sample.StackBytes,sample.Stack.Size,sp+offset,to,size);
         };
@@ -64,13 +89,24 @@ IoctlObservation observeIoctl(const NU_SAMPLE& sample,const StackEvidence& e,boo
          */
         if(!read(0x28,&code,4)||!read(0x38,&input,4)||!read(0x48,&output,4)||
            !read(0x98,&originalCode,4)||!read(0xa8,&originalInput,4)||
-           !read(0xb8,&originalOutput,4)||!read(0x50,&deviceControl,1)||
-           deviceControl!=1||code!=originalCode||input!=originalInput||output!=originalOutput)continue;
+           !read(0xb8,&originalOutput,4)||!read(0x50,&deviceControl,1)) {
+            reject("argument_unavailable");continue;
+        }
+        if(deviceControl!=1) {reject("not_device_control");continue;}
+        if(code!=originalCode||input!=originalInput||output!=originalOutput) {
+            reject("argument_mismatch");continue;
+        }
         const auto& driver=frames[dispatch];
-        result={true,code,input,output,driver.Depth,driver.Pc,sp+0x28,path,driver.Image};
-        return result;
+        diagnosis.Observation={true,code,input,output,driver.Depth,driver.Pc,sp+0x28,path,driver.Image};
+        diagnosis.CandidateDepth=uint32_t(nt);
+        diagnosis.Rejection=nullptr;
+        return diagnosis;
     }
-    return result;
+    return diagnosis;
+}
+
+IoctlObservation observeIoctl(const NU_SAMPLE& sample,const StackEvidence& e,bool validated) {
+    return diagnoseIoctl(sample,e,validated).Observation;
 }
 
 std::string ioctlJson(const NU_SAMPLE& s,const IoctlObservation& o) {

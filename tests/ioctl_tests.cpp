@@ -38,25 +38,52 @@ int main() {
         auto s=std::make_unique<NU_SAMPLE>();
         auto e=fixture(*s);
         auto observe=[&]{return nu::observeIoctl(*s,e,true);};
+        auto diagnose=[&]{return nu::diagnoseIoctl(*s,e,true);};
+        auto rejection=[&](const char* expected) {
+            const auto result=diagnose();
+            require(result.Candidate&&!result.Observation.Observed&&result.Rejection&&
+                    std::strcmp(result.Rejection,expected)==0,"candidate rejection reason");
+        };
         auto o=observe();
         require(o.Observed&&o.Code==0x8337e020&&o.Image=="ordinary.sys"&&
                 o.Path=="irp_dispatch"&&o.InputLength==4&&o.OutputLength==8,"IRP dispatch");
+        require(diagnose().Candidate&&diagnose().Observation.Observed&&
+                !diagnose().Rejection&&diagnose().CandidateDepth==4,"observed candidate diagnostic");
         require(!nu::observeIoctl(*s,e,false).Observed,"profile mismatch");
-        e.InventoryStable=false;require(!observe().Observed,"changed inventory");e.InventoryStable=true;
-        e.ContextRecovered=false;require(!observe().Observed,"missing context");e.ContextRecovered=true;
-        e.Frames.back().Pc-=0x800;require(!observe().Observed,"exclude NtFsControlFile");e=fixture(*s);
-        e.Frames[2].Pc++;require(!observe().Observed,"exclude generic I/O calls");e=fixture(*s);
-        e.Frames[1].Sp+=8;require(!observe().Observed,"reject wrong frame extent");e=fixture(*s);
-        e.Frames[0].Kind=nu::FrameKind::MissingImage;require(!observe().Observed,"missing dispatch PE");e=fixture(*s);
-        put(*s,e.Frames.back().Sp+0x98,42);require(!observe().Observed,"argument copies differ");e=fixture(*s);
-        put(*s,e.Frames.back().Sp+0x50,0);require(!observe().Observed,"file-system selector");e=fixture(*s);
+        const auto profile=nu::diagnoseIoctl(*s,e,false);
+        require(profile.Rejection&&std::strcmp(profile.Rejection,"target_profile")==0,
+                "profile rejection reason");
+        s->Stack.Size=NU_THREAD_BYTES+1;
+        rejection("sample_bounds");e=fixture(*s);
+        e.InventoryStable=false;require(!observe().Observed,"changed inventory");
+        rejection("inventory_unstable");e.InventoryStable=true;
+        e.ContextRecovered=false;require(!observe().Observed,"missing context");
+        rejection("context_unavailable");e.ContextRecovered=true;
+        e.Frames.back().Pc-=0x800;require(!observe().Observed,"exclude NtFsControlFile");
+        require(!diagnose().Candidate&&!diagnose().Rejection,"unrelated sample stays quiet");e=fixture(*s);
+        e.Frames[2].Pc++;require(!observe().Observed,"exclude generic I/O calls");
+        rejection("return_chain_mismatch");e=fixture(*s);
+        e.Frames[1].Sp+=8;require(!observe().Observed,"reject wrong frame extent");
+        rejection("frame_extent_mismatch");e=fixture(*s);
+        e.Frames[0].Kind=nu::FrameKind::MissingImage;require(!observe().Observed,"missing dispatch PE");
+        rejection("invalid_frame_prefix");e=fixture(*s);
+        put(*s,e.Frames.back().Sp+0x98,42);require(!observe().Observed,"argument copies differ");
+        rejection("argument_mismatch");e=fixture(*s);
+        put(*s,e.Frames.back().Sp+0x50,0);require(!observe().Observed,"file-system selector");
+        rejection("not_device_control");e=fixture(*s);
         s->Stack.Size=uint32_t(e.Frames.back().Sp-s->Stack.Base+0xba);
         require(!observe().Observed,"truncated argument");e=fixture(*s);
+        s->Stack.Size=uint32_t(e.Frames.back().Sp-s->Stack.Base+0xba);
+        rejection("argument_unavailable");e=fixture(*s);
         e.StackTruncated=true;require(observe().Observed,"retain complete observed prefix");
         e.Frames.push_back({s->KernelBase+0x888888,s->KernelBase+0x888888,
             e.Frames.back().Sp+0x70,5,nu::FrameKind::MissingImage,"outer.sys"});
         require(observe().Observed,"retain prefix before unavailable outer frame");
         e=fixture(*s,true);o=observe();require(o.Observed&&o.Path=="fast_io_dispatch","fast I/O");
+        e.Frames.erase(e.Frames.begin());
+        for(size_t i=0;i<e.Frames.size();++i)e.Frames[i].Depth=uint32_t(i);
+        rejection("missing_dispatch_frame");
+        e=fixture(*s,true);
         e.Frames[0].Image="driver\"\\\n.sys";o=observe();
         require(nu::ioctlJson(*s,o).find("driver\\\"\\\\\\u000a.sys")!=std::string::npos,"JSON escape");
         e.Frames.erase(e.Frames.begin());require(!observe().Observed,"missing driver frame");
