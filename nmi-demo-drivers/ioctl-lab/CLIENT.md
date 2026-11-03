@@ -18,7 +18,9 @@ buffer lengths, start/end Windows FILETIME, elapsed time, Win32 result, and
 validated reply. The summary gives sent/completed counts. The status code uses
 read access; evaluate uses write access. `--read-only` is expected to fail
 before dispatch, while `--bad-length` reaches dispatch and is rejected there.
-The 20 ms hold is an artificial active calculation for sampling experiments.
+Negative controls pass only when every request fails with the expected Win32
+error. The summary records `expected_win32_error` and `unexpected_results`.
+The 20 ms hold adds artificial dispatch time for sampling tests.
 
 The client cannot establish a Bubblewalk finding alone. Correlate its code,
 lengths, and time window with Bubblewalk `nmi_ioctl` events, then report NMI

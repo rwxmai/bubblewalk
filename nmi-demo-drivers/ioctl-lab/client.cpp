@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <winioctl.h>
+#include <winternl.h>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -124,9 +125,20 @@ int wmain(int argc, wchar_t** argv) {
     }
     const DWORD code = evaluate ? LAB_IOCTL_EVALUATE : LAB_IOCTL_STATUS;
     const char* mode = evaluate ? "evaluate" : "status";
+    const bool negativeControl = options.readOnly || options.badLength;
+    // The driver completes a malformed input with STATUS_INVALID_BUFFER_SIZE.
+    const DWORD expectedError = options.readOnly ? ERROR_ACCESS_DENIED :
+        options.badLength ? RtlNtStatusToDosError(static_cast<NTSTATUS>(0xC0000206u)) :
+        ERROR_SUCCESS;
+    if (negativeControl && expectedError == ERROR_MR_MID_NOT_FOUND) {
+        std::fprintf(stderr, "Cannot map the expected driver status to a Win32 error\n");
+        CloseHandle(device);
+        return 1;
+    }
     unsigned succeeded = 0;
     unsigned failed = 0;
     unsigned invalidReplies = 0;
+    unsigned unexpectedResults = 0;
 
     for (unsigned i = 0; i < options.count; ++i) {
         LAB_REQUEST request{LAB_VERSION, i + 1, options.targetPid, options.holdMs};
@@ -151,6 +163,7 @@ int wmain(int argc, wchar_t** argv) {
             reply.Decision == (evaluate ? LAB_DECISION_DENIED : 0u) &&
             (!evaluate || reply.RequestId == i + 1);
         if (ok && !replyValid) ++invalidReplies;
+        if (negativeControl && (ok || error != expectedError)) ++unexpectedResults;
 
         std::printf("{\"event\":\"lab_ioctl_request\",\"request_id\":%u,"
             "\"mode\":\"%s\",\"case\":\"%s\",\"submitted_ioctl\":\"0x%08lX\","
@@ -171,10 +184,11 @@ int wmain(int argc, wchar_t** argv) {
     }
     std::printf("{\"event\":\"lab_ioctl_summary\",\"mode\":\"%s\","
                 "\"case\":\"%s\",\"sent\":%u,\"succeeded\":%u,"
-                "\"failed\":%u,\"invalid_replies\":%u}\n",
+                "\"failed\":%u,\"invalid_replies\":%u,"
+                "\"expected_win32_error\":%lu,\"unexpected_results\":%u}\n",
                 mode, caseName(options), options.count, succeeded, failed,
-                invalidReplies);
+                invalidReplies, expectedError, unexpectedResults);
     CloseHandle(device);
-    if (options.readOnly || options.badLength) return succeeded == 0 ? 0 : 1;
+    if (negativeControl) return unexpectedResults == 0 ? 0 : 1;
     return failed == 0 && invalidReplies == 0 ? 0 : 1;
 }
